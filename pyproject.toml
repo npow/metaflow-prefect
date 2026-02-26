@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "metaflow-prefect"
-version = "0.1.0"
+version = "0.1.2"
 description = "Metaflow extension: deploy and run flows as Prefect deployments"
 readme = "README.md"
 license = "Apache-2.0"

@@ -128,6 +128,7 @@ def _emit_header(cb: _CB, spec: FlowSpec, cfg: PrefectFlowConfig) -> None:
     cb.emit("TAGS: list[str] = %r" % list(spec.tags))
     cb.emit("NAMESPACE: str | None = %r" % spec.namespace)
     cb.emit("SCHEDULE_CRON: str | None = %r" % spec.schedule_cron)
+    cb.emit("WITH_DECORATORS: list[str] = %r" % list(cfg.with_decorators))
 
 
 def _emit_helpers(cb: _CB, cfg: PrefectFlowConfig) -> None:
@@ -227,6 +228,10 @@ def _emit_helpers(cb: _CB, cfg: PrefectFlowConfig) -> None:
     cb.indent()
     cb.emit('cmd += ["--tag", _tag]')
     cb.dedent()
+    cb.emit("for _deco in WITH_DECORATORS:")
+    cb.indent()
+    cb.emit('cmd += [f"--with={_deco}"]')
+    cb.dedent()
     cb.emit("if NAMESPACE:")
     cb.indent()
     cb.emit('cmd += ["--namespace", NAMESPACE]')
@@ -244,10 +249,19 @@ def _emit_helpers(cb: _CB, cfg: PrefectFlowConfig) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _task_decorator(step: StepSpec) -> str:
+    """Build the @task(...) decorator string for *step*."""
+    parts = ['name="%s"' % step.name, "retries=%d" % step.max_user_code_retries]
+    if step.timeout_seconds is not None:
+        parts.append("timeout_seconds=%d" % step.timeout_seconds)
+    if step.retry_delay_seconds is not None:
+        parts.append("retry_delay_seconds=%d" % step.retry_delay_seconds)
+    return "@task(%s)" % ", ".join(parts)
+
+
 def _emit_task(cb: _CB, step: StepSpec, spec: FlowSpec, cfg: PrefectFlowConfig) -> None:
     """Emit the ``@task`` function for *step*."""
-    retries = step.max_user_code_retries
-    cb.emit('@task(name="%s", retries=%d)' % (step.name, retries))
+    cb.emit(_task_decorator(step))
 
     # The Metaflow "start" step always has step.name == "start".  Its
     # node_type may be START (linear), FOREACH, or SPLIT depending on how
@@ -327,6 +341,10 @@ def _emit_task(cb: _CB, step: StepSpec, spec: FlowSpec, cfg: PrefectFlowConfig) 
     cb.emit("pass")
     cb.dedent()
 
+    # --- @environment vars: merge into subprocess env ---
+    if step.env_vars:
+        cb.emit("_extra_env.update(%r)" % dict(step.env_vars))
+
     # --- run the step ---
     cb.emit("logger.info(f\"Metaflow step '%s' task_id={task_id}\")" % step.name)
     cb.emit("cmd = _step_cmd(")
@@ -401,11 +419,19 @@ def _emit_start_init(cb: _CB, spec: FlowSpec) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _flow_decorator(spec: FlowSpec, cfg: PrefectFlowConfig) -> str:
+    """Build the @flow(...) decorator string."""
+    parts = ["name=%r" % spec.name, "description=%r" % (spec.description or spec.name)]
+    if cfg.workflow_timeout is not None:
+        parts.append("timeout_seconds=%d" % cfg.workflow_timeout)
+    return "@flow(%s)" % ", ".join(parts)
+
+
 def _emit_flow(cb: _CB, spec: FlowSpec, cfg: PrefectFlowConfig) -> None:
     """Emit the top-level ``@flow`` function."""
     # Schedule is registered at deploy time via the CLI; the @flow decorator
     # itself carries only the name and description here.
-    cb.emit("@flow(name=%r, description=%r)" % (spec.name, spec.description or spec.name))
+    cb.emit(_flow_decorator(spec, cfg))
     sig = _flow_signature(spec.parameters)
     cb.emit("def %s(%s) -> None:" % (_python_name(spec.name), sig))
     cb.indent()
@@ -448,10 +474,12 @@ def _emit_flow(cb: _CB, spec: FlowSpec, cfg: PrefectFlowConfig) -> None:
             cb.emit("%s_nsplits: int = %s_pair[1]" % (var, var))
             body_name = foreach_body[step.name]
             body_var = "_tid_%s_list" % body_name
+            futures_var = "_futures_%s" % body_name
             cb.emit(
-                "%s: list[str] = [%s(run_id, %s, split_index=_i) for _i in range(%s_nsplits)]"
-                % (body_var, _task_fn(body_name), var, var)
+                "%s = [%s.submit(run_id, %s, split_index=_i) for _i in range(%s_nsplits)]"
+                % (futures_var, _task_fn(body_name), var, var)
             )
+            cb.emit("%s: list[str] = [_f.result() for _f in %s]" % (body_var, futures_var))
             task_id_vars[body_name] = body_var
 
         elif is_start:
@@ -486,13 +514,15 @@ def _emit_flow(cb: _CB, spec: FlowSpec, cfg: PrefectFlowConfig) -> None:
             cb.emit("%s: str = %s_pair[0]" % (var, var))
             cb.emit("%s_nsplits: int = %s_pair[1]" % (var, var))
 
-            # Immediately emit the dynamic body-step list comprehension
+            # Immediately emit the concurrent body-step submissions
             body_name = foreach_body[step.name]
             body_var = "_tid_%s_list" % body_name
+            futures_var = "_futures_%s" % body_name
             cb.emit(
-                "%s: list[str] = [%s(run_id, %s, split_index=_i) for _i in range(%s_nsplits)]"
-                % (body_var, _task_fn(body_name), var, var)
+                "%s = [%s.submit(run_id, %s, split_index=_i) for _i in range(%s_nsplits)]"
+                % (futures_var, _task_fn(body_name), var, var)
             )
+            cb.emit("%s: list[str] = [_f.result() for _f in %s]" % (body_var, futures_var))
             # register body var so the foreach join can find it
             task_id_vars[body_name] = body_var
 

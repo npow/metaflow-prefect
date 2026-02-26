@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -138,31 +139,127 @@ class TestAnalyzeGraphParams:
         assert count_param.default == 3
 
 
+def _make_mock_graph(parallel_foreach: bool = False, deco_names: list[str] | None = None) -> Any:
+    """Return a (graph, flow) mock pair for validation tests."""
+    from unittest.mock import MagicMock
+
+    deco_names = deco_names or []
+    decos = []
+    for dname in deco_names:
+        d = MagicMock()
+        d.name = dname
+        decos.append(d)
+
+    node = MagicMock()
+    node.name = "start"
+    node.parallel_foreach = parallel_foreach
+    node.decorators = decos
+    node.in_funcs = []
+    node.out_funcs = []
+    node.split_parents = []
+    node.type = "start"
+
+    graph = MagicMock()
+    graph.__iter__ = MagicMock(return_value=iter([node]))
+    graph.__getitem__ = MagicMock(return_value=node)
+
+    flow = MagicMock()
+    flow.name = "BadFlow"
+    flow._get_parameters = MagicMock(return_value=[])
+    flow._flow_decorators = {}
+
+    return graph, flow
+
+
 class TestValidation:
     """analyze_graph raises for unsupported features."""
 
     def test_parallel_foreach_raises(self) -> None:
-        """@parallel decorator should raise NotSupportedException."""
-        from unittest.mock import MagicMock
-
-        # Build a fake graph with a parallel_foreach node
-        node = MagicMock()
-        node.name = "par_step"
-        node.parallel_foreach = True
-        node.decorators = []
-        node.in_funcs = []
-        node.out_funcs = []
-        node.split_parents = []
-        node.type = "start"
-
-        graph = MagicMock()
-        graph.__iter__ = MagicMock(return_value=iter([node]))
-        graph.__getitem__ = MagicMock(return_value=node)
-
-        flow = MagicMock()
-        flow.name = "BadFlow"
-        flow._get_parameters = MagicMock(return_value=[])
-        flow._flow_decorators = {}
-
+        graph, flow = _make_mock_graph(parallel_foreach=True)
         with pytest.raises(NotSupportedException):
             analyze_graph(graph, flow)
+
+    def test_batch_raises(self) -> None:
+        graph, flow = _make_mock_graph(deco_names=["batch"])
+        with pytest.raises(NotSupportedException, match="@batch"):
+            analyze_graph(graph, flow)
+
+    def test_slurm_raises(self) -> None:
+        graph, flow = _make_mock_graph(deco_names=["slurm"])
+        with pytest.raises(NotSupportedException, match="@slurm"):
+            analyze_graph(graph, flow)
+
+    def test_trigger_raises(self) -> None:
+        graph, flow = _make_mock_graph()
+        trigger = MagicMock()
+        flow._flow_decorators = {"trigger": [trigger]}
+        with pytest.raises(NotSupportedException, match="@trigger"):
+            analyze_graph(graph, flow)
+
+    def test_trigger_on_finish_raises(self) -> None:
+        graph, flow = _make_mock_graph()
+        t = MagicMock()
+        flow._flow_decorators = {"trigger_on_finish": [t]}
+        with pytest.raises(NotSupportedException, match="@trigger_on_finish"):
+            analyze_graph(graph, flow)
+
+    def test_exit_hook_raises(self) -> None:
+        graph, flow = _make_mock_graph()
+        e = MagicMock()
+        flow._flow_decorators = {"exit_hook": [e]}
+        with pytest.raises(NotSupportedException, match="@exit_hook"):
+            analyze_graph(graph, flow)
+
+
+class TestDecoratorExtraction:
+    """StepSpec fields populated from @retry, @timeout, @environment."""
+
+    def test_timeout_seconds_from_timeout_deco(self, decorator_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = decorator_flow_graph
+        spec = analyze_graph(graph, flow)
+        start = next(s for s in spec.steps if s.name == "start")
+        assert start.timeout_seconds == 300
+
+    def test_timeout_minutes_from_timeout_deco(self, decorator_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = decorator_flow_graph
+        spec = analyze_graph(graph, flow)
+        end = next(s for s in spec.steps if s.name == "end")
+        assert end.timeout_seconds == 300  # 5 * 60
+
+    def test_retry_delay_seconds(self, decorator_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = decorator_flow_graph
+        spec = analyze_graph(graph, flow)
+        start = next(s for s in spec.steps if s.name == "start")
+        assert start.retry_delay_seconds == 60  # 1 minute
+
+    def test_retry_count(self, decorator_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = decorator_flow_graph
+        spec = analyze_graph(graph, flow)
+        start = next(s for s in spec.steps if s.name == "start")
+        assert start.max_user_code_retries == 2
+
+    def test_env_vars_extracted(self, decorator_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = decorator_flow_graph
+        spec = analyze_graph(graph, flow)
+        start = next(s for s in spec.steps if s.name == "start")
+        env = dict(start.env_vars)
+        assert env.get("MY_VAR") == "hello"
+        assert env.get("OTHER") == "world"
+
+    def test_no_env_vars_on_plain_step(self, decorator_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = decorator_flow_graph
+        spec = analyze_graph(graph, flow)
+        end = next(s for s in spec.steps if s.name == "end")
+        assert end.env_vars == ()
+
+    def test_no_timeout_on_plain_step(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = simple_flow_graph
+        spec = analyze_graph(graph, flow)
+        for step in spec.steps:
+            assert step.timeout_seconds is None
+
+    def test_no_retry_delay_on_plain_step(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = simple_flow_graph
+        spec = analyze_graph(graph, flow)
+        for step in spec.steps:
+            assert step.retry_delay_seconds is None

@@ -109,6 +109,12 @@ def param_flow_graph() -> tuple[Any, Any]:
     return _load_flow_graph(str(FLOWS_DIR / "param_flow.py"))
 
 
+@pytest.fixture(scope="session")
+def decorator_flow_graph() -> tuple[Any, Any]:
+    """(graph, flow) for DecoratorFlow (@retry, @timeout, @environment)."""
+    return _load_flow_graph(str(FLOWS_DIR / "decorator_flow.py"))
+
+
 # ---------------------------------------------------------------------------
 # Mock Metaflow infrastructure objects
 # ---------------------------------------------------------------------------
