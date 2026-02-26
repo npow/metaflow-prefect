@@ -5,27 +5,11 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Run your Metaflow flows on Prefect without rewriting them.
+Deploy and run Metaflow flows as Prefect deployments.
 
-## The problem
-
-Metaflow is great for defining ML pipelines — but its built-in scheduler is basic. Prefect has
-first-class scheduling, observability, and a rich UI, but adopting it means rewriting your flows
-from scratch. There's no bridge between the two.
-
-## Quick start
-
-```bash
-pip install metaflow-prefect
-```
-
-```bash
-# Generate a Prefect flow file from your existing Metaflow flow
-python my_flow.py prefect create my_flow_prefect.py
-
-# Run it
-python my_flow_prefect.py
-```
+`metaflow-prefect` generates a self-contained Prefect flow file from any Metaflow flow, letting
+you schedule, deploy, and monitor your pipelines through Prefect while keeping all your existing
+Metaflow code unchanged.
 
 ## Install
 
@@ -39,6 +23,13 @@ Or from source:
 git clone https://github.com/npow/metaflow-prefect.git
 cd metaflow-prefect
 pip install -e ".[dev]"
+```
+
+## Quick start
+
+```bash
+python my_flow.py prefect create my_flow_prefect.py
+python my_flow_prefect.py
 ```
 
 ## Usage
@@ -85,6 +76,55 @@ Parameters defined with `metaflow.Parameter` are forwarded automatically:
 ```bash
 python param_flow.py prefect create param_flow_prefect.py
 python param_flow_prefect.py --message "hello" --count 5
+```
+
+## Configuration
+
+### Metadata service and datastore
+
+By default, `metaflow-prefect` uses whatever metadata and datastore backends are active in your
+Metaflow environment. The generated Prefect file bakes in `METADATA_TYPE` and `DATASTORE_TYPE`
+at creation time so every step subprocess uses the same backend.
+
+To use a remote metadata service or object store, configure them before running `prefect create`:
+
+```bash
+# Remote metadata service + S3 datastore
+python my_flow.py \
+  --metadata=service \
+  --datastore=s3 \
+  prefect create my_flow_prefect.py
+```
+
+Or via environment variables (applied to all flows):
+
+```bash
+export METAFLOW_DEFAULT_METADATA=service
+export METAFLOW_DEFAULT_DATASTORE=s3
+python my_flow.py prefect create my_flow_prefect.py
+```
+
+The generated file will contain:
+
+```python
+METADATA_TYPE: str = 'service'
+DATASTORE_TYPE: str = 's3'
+```
+
+Every `metaflow step` subprocess will then use those backends automatically.
+
+### Step decorators (`--with`)
+
+Inject Metaflow step decorators at deploy time without modifying the flow source:
+
+```bash
+# Run each step inside a sandbox (e.g. metaflow-sandbox extension)
+python my_flow.py prefect create my_flow_prefect.py --with=sandbox
+
+# Multiple decorators are supported
+python my_flow.py prefect deploy --name prod \
+  --with=sandbox \
+  --with="resources:cpu=4,memory=8000"
 ```
 
 ## How it works

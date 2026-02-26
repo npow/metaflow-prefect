@@ -128,6 +128,7 @@ def _emit_header(cb: _CB, spec: FlowSpec, cfg: PrefectFlowConfig) -> None:
     cb.emit("TAGS: list[str] = %r" % list(spec.tags))
     cb.emit("NAMESPACE: str | None = %r" % spec.namespace)
     cb.emit("SCHEDULE_CRON: str | None = %r" % spec.schedule_cron)
+    cb.emit("WITH_DECORATORS: list[str] = %r" % list(cfg.with_decorators))
 
 
 def _emit_helpers(cb: _CB, cfg: PrefectFlowConfig) -> None:
@@ -226,6 +227,10 @@ def _emit_helpers(cb: _CB, cfg: PrefectFlowConfig) -> None:
     cb.emit("for _tag in TAGS:")
     cb.indent()
     cb.emit('cmd += ["--tag", _tag]')
+    cb.dedent()
+    cb.emit("for _deco in WITH_DECORATORS:")
+    cb.indent()
+    cb.emit('cmd += [f"--with={_deco}"]')
     cb.dedent()
     cb.emit("if NAMESPACE:")
     cb.indent()

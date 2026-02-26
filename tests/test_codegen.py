@@ -397,3 +397,27 @@ class TestGeneratePrefectFileConfig:
         spec = self._spec(simple_flow_graph)
         src = generate_prefect_file(spec, _make_cfg())
         assert "TAGS" in src
+
+    def test_with_decorators_constant_present(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        """WITH_DECORATORS constant should always appear in the generated file."""
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg())
+        assert "WITH_DECORATORS" in src
+
+    def test_with_decorators_empty_by_default(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg())
+        assert "WITH_DECORATORS: list[str] = []" in src
+
+    def test_with_decorators_values_emitted(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg(with_decorators=("sandbox", "resources:cpu=4")))
+        assert "'sandbox'" in src
+        assert "'resources:cpu=4'" in src
+
+    def test_with_decorators_forwarded_in_step_cmd(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        """The generated _step_cmd should loop over WITH_DECORATORS and emit --with flags."""
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg(with_decorators=("sandbox",)))
+        assert "for _deco in WITH_DECORATORS" in src
+        assert '"--with={_deco}"' in src or "'--with={_deco}'" in src or "f\"--with={_deco}\"" in src

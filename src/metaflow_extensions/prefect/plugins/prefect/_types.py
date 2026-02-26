@@ -74,3 +74,4 @@ class PrefectFlowConfig:
     code_package_metadata: str = ""
     username: str = ""
     max_workers: int = 10
+    with_decorators: tuple[str, ...] = ()  # extra --with=<deco> injected on every step
