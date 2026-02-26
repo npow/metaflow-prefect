@@ -397,3 +397,110 @@ class TestGeneratePrefectFileConfig:
         spec = self._spec(simple_flow_graph)
         src = generate_prefect_file(spec, _make_cfg())
         assert "TAGS" in src
+
+    def test_with_decorators_constant_present(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        """WITH_DECORATORS constant should always appear in the generated file."""
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg())
+        assert "WITH_DECORATORS" in src
+
+    def test_with_decorators_empty_by_default(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg())
+        assert "WITH_DECORATORS: list[str] = []" in src
+
+    def test_with_decorators_values_emitted(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg(with_decorators=("sandbox", "resources:cpu=4")))
+        assert "'sandbox'" in src
+        assert "'resources:cpu=4'" in src
+
+    def test_with_decorators_forwarded_in_step_cmd(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        """The generated _step_cmd should loop over WITH_DECORATORS and emit --with flags."""
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg(with_decorators=("sandbox",)))
+        assert "for _deco in WITH_DECORATORS" in src
+        assert '"--with={_deco}"' in src or "'--with={_deco}'" in src or "f\"--with={_deco}\"" in src
+
+    def test_workflow_timeout_in_flow_decorator(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg(workflow_timeout=3600))
+        assert "timeout_seconds=3600" in src
+
+    def test_no_workflow_timeout_by_default(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg())
+        # timeout_seconds should NOT appear in the @flow decorator when not set
+        import re
+        flow_deco_line = next(
+            (l for l in src.splitlines() if l.startswith("@flow(")), None
+        )
+        assert flow_deco_line is not None
+        assert "timeout_seconds" not in flow_deco_line
+
+
+class TestDecoratorCodegen:
+    """Codegen output for @retry, @timeout, @environment decorated steps."""
+
+    @pytest.fixture
+    def src(self, decorator_flow_graph: tuple[Any, Any]) -> str:
+        graph, flow = decorator_flow_graph
+        spec = analyze_graph(graph, flow)
+        return generate_prefect_file(spec, _make_cfg())
+
+    def test_is_valid_python(self, src: str) -> None:
+        _parse(src)
+
+    def test_timeout_in_task_decorator(self, src: str) -> None:
+        """@timeout(seconds=300) → timeout_seconds=300 on @task."""
+        assert "timeout_seconds=300" in src
+
+    def test_retry_delay_in_task_decorator(self, src: str) -> None:
+        """@retry(minutes_between_retries=1) → retry_delay_seconds=60 on @task."""
+        assert "retry_delay_seconds=60" in src
+
+    def test_retry_count_in_task_decorator(self, src: str) -> None:
+        assert "retries=2" in src
+
+    def test_env_vars_in_task_body(self, src: str) -> None:
+        """@environment vars appear as _extra_env.update({...}) in the task body."""
+        assert "_extra_env.update(" in src
+        assert "MY_VAR" in src
+        assert "hello" in src
+
+    def test_timeout_minutes_converted(self, src: str) -> None:
+        """@timeout(minutes=5) → timeout_seconds=300."""
+        # Both 300 values (start=300s, end=5*60=300) should appear
+        assert src.count("timeout_seconds=300") == 2
+
+    def test_no_env_vars_on_plain_step(self, src: str) -> None:
+        """Steps without @environment must not emit _extra_env.update."""
+        # The end step has no @environment decorator.
+        # Count occurrences — only start has it, so exactly one update call.
+        assert src.count("_extra_env.update(") == 1
+
+
+class TestForeachConcurrency:
+    """Foreach body tasks use .submit() for concurrent execution."""
+
+    @pytest.fixture
+    def src(self, foreach_flow_graph: tuple[Any, Any]) -> str:
+        graph, flow = foreach_flow_graph
+        spec = analyze_graph(graph, flow)
+        return generate_prefect_file(spec, _make_cfg())
+
+    def test_is_valid_python(self, src: str) -> None:
+        _parse(src)
+
+    def test_submit_used_for_body(self, src: str) -> None:
+        assert ".submit(" in src
+
+    def test_result_collected(self, src: str) -> None:
+        assert ".result()" in src
+
+    def test_no_direct_body_call_in_comprehension(self, src: str) -> None:
+        """The foreach body should NOT be called directly (only via .submit)."""
+        import re
+        # Direct call pattern: _step_foreach_step(run_id, ...split_index
+        direct = re.search(r"_step_foreach_step\(run_id,.*split_index", src)
+        assert direct is None, "foreach body called directly instead of via .submit()"

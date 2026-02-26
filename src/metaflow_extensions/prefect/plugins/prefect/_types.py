@@ -37,6 +37,9 @@ class StepSpec:
     max_user_code_retries: int = 0
     is_foreach_join: bool = False   # join that closes a foreach
     is_split_join: bool = False     # join that closes a static split
+    timeout_seconds: int | None = None        # from @timeout(seconds=N)
+    retry_delay_seconds: int | None = None    # from @retry(minutes_between_retries=N)
+    env_vars: tuple[tuple[str, str], ...] = ()  # from @environment(vars={...})
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,7 @@ class FlowSpec:
     schedule_cron: str | None = None
     tags: tuple[str, ...] = field(default_factory=tuple)
     namespace: str | None = None
+    project_name: str | None = None    # from @project(name=...) if present
 
 
 @dataclass(frozen=True)
@@ -74,3 +78,5 @@ class PrefectFlowConfig:
     code_package_metadata: str = ""
     username: str = ""
     max_workers: int = 10
+    with_decorators: tuple[str, ...] = ()  # extra --with=<deco> injected on every step
+    workflow_timeout: int | None = None    # from --workflow-timeout (seconds)

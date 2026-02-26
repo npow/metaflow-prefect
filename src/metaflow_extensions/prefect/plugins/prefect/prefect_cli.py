@@ -67,6 +67,19 @@ def prefect(obj: object) -> None:  # type: ignore[override]
     show_default=True,
     help="Maximum number of concurrent Prefect tasks.",
 )
+@click.option(
+    "--with",
+    "with_decorators",
+    multiple=True,
+    default=None,
+    help="Inject a decorator on every step (repeatable), e.g. --with=sandbox.",
+)
+@click.option(
+    "--workflow-timeout",
+    default=None,
+    type=int,
+    help="Flow-level timeout in seconds.",
+)
 @click.pass_obj
 def create(
     obj: object,
@@ -74,13 +87,15 @@ def create(
     tags: tuple[str, ...],
     user_namespace: str | None,
     max_workers: int,
+    with_decorators: tuple[str, ...],
+    workflow_timeout: int | None,
 ) -> None:
     if os.path.abspath(sys.argv[0]) == os.path.abspath(output_file):
         raise MetaflowException(
             "Output file name cannot be the same as the flow file name."
         )
 
-    _make_flow_and_write(obj, output_file, tags, user_namespace, max_workers)
+    _make_flow_and_write(obj, output_file, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
 
     # type: ignore — obj is the Metaflow CLI context object
     obj.echo(  # type: ignore[attr-defined]
@@ -113,12 +128,18 @@ def create(
     default=None,
 )
 @click.option("--max-workers", default=10, show_default=True)
+@click.option("--with", "with_decorators", multiple=True, default=None,
+              help="Inject a decorator on every step (repeatable).")
+@click.option("--workflow-timeout", default=None, type=int,
+              help="Flow-level timeout in seconds.")
 @click.pass_obj
 def run(
     obj: object,
     tags: tuple[str, ...],
     user_namespace: str | None,
     max_workers: int,
+    with_decorators: tuple[str, ...],
+    workflow_timeout: int | None,
 ) -> None:
     import importlib.util
     import tempfile
@@ -127,7 +148,7 @@ def run(
         tmp_path = tmp.name
 
     try:
-        _make_flow_and_write(obj, tmp_path, tags, user_namespace, max_workers)
+        _make_flow_and_write(obj, tmp_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
         spec = importlib.util.spec_from_file_location("_mf_prefect_flow", tmp_path)
         mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
@@ -165,6 +186,10 @@ def run(
     default=False,
     help="Create the deployment in a paused state.",
 )
+@click.option("--with", "with_decorators", multiple=True, default=None,
+              help="Inject a decorator on every step (repeatable).")
+@click.option("--workflow-timeout", default=None, type=int,
+              help="Flow-level timeout in seconds.")
 @click.pass_obj
 def deploy(
     obj: object,
@@ -174,6 +199,8 @@ def deploy(
     max_workers: int,
     work_pool: str | None,
     paused: bool,
+    with_decorators: tuple[str, ...],
+    workflow_timeout: int | None,
 ) -> None:
     import importlib.util
     import tempfile
@@ -182,7 +209,7 @@ def deploy(
         tmp_path = tmp.name
 
     try:
-        _make_flow_and_write(obj, tmp_path, tags, user_namespace, max_workers)
+        _make_flow_and_write(obj, tmp_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
         spec = importlib.util.spec_from_file_location("_mf_prefect_flow", tmp_path)
         mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
@@ -218,6 +245,8 @@ def _make_flow_and_write(
     tags: tuple[str, ...],
     user_namespace: str | None,
     max_workers: int,
+    with_decorators: tuple[str, ...] = (),
+    workflow_timeout: int | None = None,
 ) -> None:
     pf = PrefectFlow(
         name=_resolve_name(obj),  # type: ignore[arg-type]
@@ -237,6 +266,8 @@ def _make_flow_and_write(
         max_workers=max_workers,
         description=obj.flow.__doc__,               # type: ignore[attr-defined]
         flow_file=os.path.abspath(sys.argv[0]),
+        with_decorators=list(with_decorators),
+        workflow_timeout=workflow_timeout,
     )
     source = pf.compile()
     with open(output_file, "w") as f:
@@ -280,6 +311,17 @@ def _resolve_name(obj: object) -> str:
     import re
 
     name = obj.flow.name  # type: ignore[attr-defined]
+
+    # @project support: prefix with project name when present
+    try:
+        project_decos = obj.flow._flow_decorators.get("project")  # type: ignore[attr-defined]
+        if project_decos:
+            project_name = project_decos[0].attributes.get("name", "")
+            if project_name:
+                name = "%s.%s" % (project_name, name)
+    except Exception:
+        pass
+
     # Keep only alphanumerics, hyphens, underscores, dots
     if re.search(r"[^a-zA-Z0-9_\-\.]", name):
         raise MetaflowException(

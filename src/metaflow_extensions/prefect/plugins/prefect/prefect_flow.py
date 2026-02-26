@@ -49,6 +49,7 @@ class PrefectFlow:
         description: str | None = None,
         flow_file: str | None = None,
         workflow_timeout: int | None = None,
+        with_decorators: list[str] | None = None,
     ) -> None:
         self._graph = graph
         self._flow = flow
@@ -67,6 +68,8 @@ class PrefectFlow:
             code_package_metadata=code_package_metadata or "",
             username=username or get_username(),
             max_workers=max_workers,
+            with_decorators=tuple(with_decorators or []),
+            workflow_timeout=workflow_timeout,
         )
 
     def compile(self) -> str:
@@ -82,5 +85,6 @@ class PrefectFlow:
                 schedule_cron=spec.schedule_cron,
                 tags=tuple(self._tags) if self._tags else spec.tags,
                 namespace=self._namespace if self._namespace is not None else spec.namespace,
+                project_name=spec.project_name,
             )
         return generate_prefect_file(spec, self._cfg)

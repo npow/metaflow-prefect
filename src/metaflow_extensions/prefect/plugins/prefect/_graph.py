@@ -44,13 +44,15 @@ def analyze_graph(
 
     Raises:
         NotSupportedException: For graph features not yet handled by this integration.
+        PrefectException: For configuration errors (e.g. missing parameter defaults).
     """
-    _validate(graph)
+    _validate(graph, flow)
 
     steps = _topological_order(graph)
     parameters = _extract_parameters(flow)
     schedule_cron = _extract_schedule(flow)
     tags_raw = getattr(flow, "_tags", None) or []
+    project_name = _extract_project(flow)
 
     return FlowSpec(
         name=flow.name,
@@ -60,6 +62,7 @@ def analyze_graph(
         schedule_cron=schedule_cron,
         tags=tuple(tags_raw),
         namespace=None,
+        project_name=project_name,
     )
 
 
@@ -68,15 +71,34 @@ def analyze_graph(
 # ---------------------------------------------------------------------------
 
 
-def _validate(graph: Any) -> None:
+def _validate(graph: Any, flow: Any) -> None:
+    """Raise NotSupportedException for features incompatible with Prefect."""
+    # Step-level checks
     for node in graph:
         if node.parallel_foreach:
             raise NotSupportedException(
                 "Deploying flows with @parallel to Prefect is not yet supported."
             )
-        if any(d.name == "batch" for d in node.decorators):
+        for deco in node.decorators:
+            if deco.name == "batch":
+                raise NotSupportedException(
+                    "Step *%s* uses @batch which is not supported with Prefect. "
+                    "Remove @batch or use --with=batch on the Prefect CLI instead." % node.name
+                )
+            if deco.name == "slurm":
+                raise NotSupportedException(
+                    "Step *%s* uses @slurm which is not supported with Prefect." % node.name
+                )
+
+    # Flow-level decorator checks
+    for bad_deco in ("trigger", "trigger_on_finish", "exit_hook"):
+        try:
+            decos = flow._flow_decorators.get(bad_deco)
+        except Exception:
+            decos = None
+        if decos:
             raise NotSupportedException(
-                "Step *%s* uses @batch which is not supported with Prefect." % node.name
+                "@%s is not supported with Prefect deployments." % bad_deco
             )
 
 
@@ -87,6 +109,38 @@ def _max_user_code_retries(node: Any) -> int:
         user_retries, _ = deco.step_task_retry_count()
         max_retries = max(max_retries, user_retries)
     return max_retries
+
+
+def _step_retry_delay_seconds(node: Any) -> int | None:
+    """Return retry delay in seconds from @retry(minutes_between_retries=N), or None."""
+    for deco in node.decorators:
+        if deco.name == "retry":
+            mins = deco.attributes.get("minutes_between_retries", 0)
+            if mins:
+                return int(mins) * 60
+    return None
+
+
+def _step_timeout_seconds(node: Any) -> int | None:
+    """Return timeout in seconds from @timeout(seconds=N) or @timeout(minutes=N), or None."""
+    for deco in node.decorators:
+        if deco.name == "timeout":
+            secs = deco.attributes.get("seconds", 0) or 0
+            mins = deco.attributes.get("minutes", 0) or 0
+            hours = deco.attributes.get("hours", 0) or 0
+            total = int(secs) + int(mins) * 60 + int(hours) * 3600
+            if total > 0:
+                return total
+    return None
+
+
+def _step_env_vars(node: Any) -> tuple[tuple[str, str], ...]:
+    """Return (key, value) pairs from @environment(vars={...}), or empty tuple."""
+    for deco in node.decorators:
+        if deco.name == "environment":
+            raw = deco.attributes.get("vars") or {}
+            return tuple(sorted(raw.items()))
+    return ()
 
 
 def _is_foreach_join(graph: Any, node: Any) -> bool:
@@ -136,6 +190,9 @@ def _topological_order(graph: Any) -> list[StepSpec]:
             max_user_code_retries=_max_user_code_retries(node),
             is_foreach_join=_is_foreach_join(graph, node),
             is_split_join=_is_split_join(graph, node),
+            timeout_seconds=_step_timeout_seconds(node),
+            retry_delay_seconds=_step_retry_delay_seconds(node),
+            env_vars=_step_env_vars(node),
         )
         result.append(spec)
 
@@ -199,3 +256,14 @@ def _extract_schedule(flow: Any) -> str | None:
     if s.attributes.get("daily"):
         return "0 0 * * *"
     return None
+
+
+def _extract_project(flow: Any) -> str | None:
+    """Return the project name from @project(name=...), or None."""
+    try:
+        project_decos = flow._flow_decorators.get("project")
+    except Exception:
+        return None
+    if not project_decos:
+        return None
+    return project_decos[0].attributes.get("name") or None
