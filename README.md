@@ -5,27 +5,11 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Run your Metaflow flows on Prefect without rewriting them.
+Deploy and run Metaflow flows as Prefect deployments.
 
-## The problem
-
-Metaflow is great for defining ML pipelines — but its built-in scheduler is basic. Prefect has
-first-class scheduling, observability, and a rich UI, but adopting it means rewriting your flows
-from scratch. There's no bridge between the two.
-
-## Quick start
-
-```bash
-pip install metaflow-prefect
-```
-
-```bash
-# Generate a Prefect flow file from your existing Metaflow flow
-python my_flow.py prefect create my_flow_prefect.py
-
-# Run it
-python my_flow_prefect.py
-```
+`metaflow-prefect` generates a self-contained Prefect flow file from any Metaflow flow, letting
+you schedule, deploy, and monitor your pipelines through Prefect while keeping all your existing
+Metaflow code unchanged.
 
 ## Install
 
@@ -39,6 +23,13 @@ Or from source:
 git clone https://github.com/npow/metaflow-prefect.git
 cd metaflow-prefect
 pip install -e ".[dev]"
+```
+
+## Quick start
+
+```bash
+python my_flow.py prefect create my_flow_prefect.py
+python my_flow_prefect.py
 ```
 
 ## Usage
