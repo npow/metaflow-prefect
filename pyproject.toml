@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "metaflow-prefect"
+version = "0.1.0"
+description = "Metaflow extension: deploy and run flows as Prefect deployments"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "metaflow>=2.10.0",
+    "prefect>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+]
+
+[tool.hatch.build.targets.wheel]
+# Install src/metaflow_extensions as a namespace package.
+# No __init__.py at src/metaflow_extensions/ — Metaflow requires it to be
+# an implicit namespace package (PEP 420).
+packages = ["src/metaflow_extensions"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "e2e: marks tests that run a real Prefect server and execute flows end-to-end",
+]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.10"

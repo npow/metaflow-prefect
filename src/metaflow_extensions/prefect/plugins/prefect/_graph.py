@@ -1,0 +1,201 @@
+"""Graph analysis utilities for the Metaflow-Prefect integration.
+
+``analyze_graph`` is the only public function.  It walks the Metaflow DAG
+and returns a ``FlowSpec`` containing an ordered list of ``StepSpec`` objects
+that ``_codegen.py`` later turns into Python source.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from typing import TYPE_CHECKING, Any
+
+from metaflow.parameters import deploy_time_eval
+
+from metaflow_extensions.prefect.plugins.prefect._types import (
+    FlowSpec,
+    NodeType,
+    ParameterSpec,
+    StepSpec,
+)
+from metaflow_extensions.prefect.plugins.prefect.exception import (
+    NotSupportedException,
+    PrefectException,
+)
+
+if TYPE_CHECKING:
+    # Only used for type-checker hints; not imported at runtime to avoid
+    # pulling in heavy Metaflow internals.
+    from metaflow.flowgraph import FlowGraph
+
+
+def analyze_graph(
+    graph: Any,  # metaflow.flowgraph.FlowGraph
+    flow: Any,   # metaflow.FlowSpec subclass instance
+) -> FlowSpec:
+    """Convert a Metaflow ``FlowGraph`` into a ``FlowSpec``.
+
+    Args:
+        graph: A Metaflow ``FlowGraph`` (the ``._graph`` attribute on a flow).
+        flow:  The Metaflow flow instance (used to read parameters and decorators).
+
+    Returns:
+        A ``FlowSpec`` with steps in topological order.
+
+    Raises:
+        NotSupportedException: For graph features not yet handled by this integration.
+    """
+    _validate(graph)
+
+    steps = _topological_order(graph)
+    parameters = _extract_parameters(flow)
+    schedule_cron = _extract_schedule(flow)
+    tags_raw = getattr(flow, "_tags", None) or []
+
+    return FlowSpec(
+        name=flow.name,
+        steps=tuple(steps),
+        parameters=tuple(parameters),
+        description=(flow.__doc__ or "").strip(),
+        schedule_cron=schedule_cron,
+        tags=tuple(tags_raw),
+        namespace=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate(graph: Any) -> None:
+    for node in graph:
+        if node.parallel_foreach:
+            raise NotSupportedException(
+                "Deploying flows with @parallel to Prefect is not yet supported."
+            )
+        if any(d.name == "batch" for d in node.decorators):
+            raise NotSupportedException(
+                "Step *%s* uses @batch which is not supported with Prefect." % node.name
+            )
+
+
+def _max_user_code_retries(node: Any) -> int:
+    """Return the maximum user-code retry count across all decorators on *node*."""
+    max_retries = 0
+    for deco in node.decorators:
+        user_retries, _ = deco.step_task_retry_count()
+        max_retries = max(max_retries, user_retries)
+    return max_retries
+
+
+def _is_foreach_join(graph: Any, node: Any) -> bool:
+    """True when *node* is a join step that closes a foreach."""
+    if node.type != "join":
+        return False
+    if not node.split_parents:
+        return False
+    return graph[node.split_parents[-1]].type == "foreach"
+
+
+def _is_split_join(graph: Any, node: Any) -> bool:
+    """True when *node* is a join step that closes a static split."""
+    if node.type != "join":
+        return False
+    if not node.split_parents:
+        return False
+    return graph[node.split_parents[-1]].type == "split"
+
+
+def _topological_order(graph: Any) -> list[StepSpec]:
+    """BFS from *start* yielding ``StepSpec`` objects in topological order."""
+    visited: set[str] = set()
+    result: list[StepSpec] = []
+    queue: deque[str] = deque(["start"])
+
+    while queue:
+        name = queue.popleft()
+        if name in visited:
+            continue
+
+        node = graph[name]
+
+        # Only process *name* once all its predecessors have been processed.
+        if any(p not in visited for p in node.in_funcs):
+            queue.append(name)
+            continue
+
+        visited.add(name)
+
+        spec = StepSpec(
+            name=node.name,
+            node_type=NodeType(node.type),
+            in_funcs=tuple(node.in_funcs),
+            out_funcs=tuple(node.out_funcs),
+            split_parents=tuple(node.split_parents),
+            max_user_code_retries=_max_user_code_retries(node),
+            is_foreach_join=_is_foreach_join(graph, node),
+            is_split_join=_is_split_join(graph, node),
+        )
+        result.append(spec)
+
+        for child in node.out_funcs:
+            if child not in visited:
+                queue.append(child)
+
+    return result
+
+
+def _param_kwarg(param: Any, key: str) -> Any:
+    """Read a kwarg from a Parameter, handling both stock and override-based subclasses.
+
+    The open-source Metaflow Parameter stores values in ``param.kwargs``.
+    Some extensions (e.g. nflx-metaflow) store them in ``param._override_kwargs``
+    with ``param.kwargs`` left empty.  We check both.
+    """
+    value = param.kwargs.get(key)
+    if value is None:
+        value = getattr(param, "_override_kwargs", {}).get(key)
+    return value
+
+
+def _extract_parameters(flow: Any) -> list[ParameterSpec]:
+    """Pull parameters from the flow and evaluate their default values."""
+    _type_map = {
+        "int": "int",
+        "float": "float",
+        "bool": "bool",
+        "str": "str",
+        "NoneType": "str",
+    }
+    params: list[ParameterSpec] = []
+    for _, param in flow._get_parameters():
+        raw_default = _param_kwarg(param, "default")
+        default = deploy_time_eval(raw_default)
+        type_name = _type_map.get(type(default).__name__, "str")
+        params.append(
+            ParameterSpec(
+                name=param.name,
+                default=default,
+                description=_param_kwarg(param, "help") or "",
+                type_name=type_name,
+            )
+        )
+    return params
+
+
+def _extract_schedule(flow: Any) -> str | None:
+    """Return a cron string from an @schedule decorator, or None."""
+    schedules = flow._flow_decorators.get("schedule")
+    if not schedules:
+        return None
+    s = schedules[0]
+    if s.attributes.get("cron"):
+        return s.attributes["cron"]
+    if s.attributes.get("weekly"):
+        return "0 0 * * 0"
+    if s.attributes.get("hourly"):
+        return "0 * * * *"
+    if s.attributes.get("daily"):
+        return "0 0 * * *"
+    return None
