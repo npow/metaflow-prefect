@@ -144,13 +144,16 @@ def run(
     import importlib.util
     import tempfile
 
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as tmp:
+    with tempfile.NamedTemporaryFile(
+        suffix=".py", delete=False, mode="w", dir=os.getcwd()
+    ) as tmp:
         tmp_path = tmp.name
 
     try:
         _make_flow_and_write(obj, tmp_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
         spec = importlib.util.spec_from_file_location("_mf_prefect_flow", tmp_path)
         mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        sys.modules[spec.name] = mod  # Make module importable for Prefect deployment introspection.
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
 
         # Call the flow's main entry-point (the @flow decorated function).
@@ -205,13 +208,16 @@ def deploy(
     import importlib.util
     import tempfile
 
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as tmp:
+    with tempfile.NamedTemporaryFile(
+        suffix=".py", delete=False, mode="w", dir=os.getcwd()
+    ) as tmp:
         tmp_path = tmp.name
 
     try:
         _make_flow_and_write(obj, tmp_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
         spec = importlib.util.spec_from_file_location("_mf_prefect_flow", tmp_path)
         mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        sys.modules[spec.name] = mod  # Make module importable for Prefect deployment introspection.
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
 
         flow_fn_name = _python_name(obj.flow.name)  # type: ignore[attr-defined]
@@ -248,13 +254,23 @@ def _make_flow_and_write(
     with_decorators: tuple[str, ...] = (),
     workflow_timeout: int | None = None,
 ) -> None:
+    package = MetaflowPackage(
+        obj.flow,                # type: ignore[attr-defined]
+        obj.environment,         # type: ignore[attr-defined]
+        obj.echo,                # type: ignore[attr-defined]
+        flow_datastore=obj.flow_datastore,  # type: ignore[attr-defined]
+    )
+    code_package_url, code_package_sha = obj.flow_datastore.save_data(  # type: ignore[attr-defined]
+        [package.blob], len_hint=1
+    )[0]
+
     pf = PrefectFlow(
         name=_resolve_name(obj),  # type: ignore[arg-type]
         graph=obj.graph,          # type: ignore[attr-defined]
         flow=obj.flow,            # type: ignore[attr-defined]
-        code_package_metadata="",
-        code_package_sha="",
-        code_package_url="",
+        code_package_metadata=package.package_metadata,
+        code_package_sha=code_package_sha,
+        code_package_url=code_package_url,
         metadata=obj.metadata,                      # type: ignore[attr-defined]
         flow_datastore=obj.flow_datastore,          # type: ignore[attr-defined]
         environment=obj.environment,                # type: ignore[attr-defined]
@@ -298,7 +314,11 @@ async def _register_deployment(
         tags=tags,
         work_pool_name=work_pool,
     )
-    deployment_id = await deployment.apply()
+    if asyncio.iscoroutine(deployment):
+        deployment = await deployment
+
+    apply_result = deployment.apply()
+    deployment_id = await apply_result if asyncio.iscoroutine(apply_result) else apply_result
     obj.echo(  # type: ignore[attr-defined]
         "Deployment *{name}* registered with id *{id}*.".format(
             name=name, id=deployment_id

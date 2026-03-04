@@ -76,6 +76,10 @@ class PrefectFlowConfig:
     code_package_url: str = ""
     code_package_sha: str = ""
     code_package_metadata: str = ""
+    environment_type: str = "local"
+    event_logger_type: str = "nullSidecarLogger"
+    monitor_type: str = "nullSidecarMonitor"
+    datastore_root: str | None = None
     username: str = ""
     max_workers: int = 10
     with_decorators: tuple[str, ...] = ()  # extra --with=<deco> injected on every step

@@ -58,6 +58,12 @@ class PrefectFlow:
         self._namespace = namespace
         self._max_workers = max_workers
         self._flow_file = flow_file or os.path.abspath(os.path.realpath(__file__))
+        env_type = getattr(environment, "TYPE", "local")
+        event_logger_type = getattr(event_logger, "TYPE", "nullSidecarLogger")
+        monitor_type = getattr(monitor, "TYPE", "nullSidecarMonitor")
+        datastore_root = getattr(
+            getattr(flow_datastore, "_storage_impl", None), "datastore_root", None
+        )
 
         self._cfg = PrefectFlowConfig(
             flow_file=self._flow_file,
@@ -66,6 +72,16 @@ class PrefectFlow:
             code_package_url=code_package_url or "",
             code_package_sha=code_package_sha or "",
             code_package_metadata=code_package_metadata or "",
+            environment_type=str(env_type) if isinstance(env_type, str) else "local",
+            event_logger_type=(
+                str(event_logger_type)
+                if isinstance(event_logger_type, str)
+                else "nullSidecarLogger"
+            ),
+            monitor_type=(
+                str(monitor_type) if isinstance(monitor_type, str) else "nullSidecarMonitor"
+            ),
+            datastore_root=str(datastore_root) if isinstance(datastore_root, str) else None,
             username=username or get_username(),
             max_workers=max_workers,
             with_decorators=tuple(with_decorators or []),
@@ -87,4 +103,85 @@ class PrefectFlow:
                 namespace=self._namespace if self._namespace is not None else spec.namespace,
                 project_name=spec.project_name,
             )
-        return generate_prefect_file(spec, self._cfg)
+        cmd_templates = self._build_step_cmd_templates(spec)
+        return generate_prefect_file(spec, self._cfg, cmd_templates=cmd_templates)
+
+    def _build_step_cmd_templates(self, spec: FlowSpec) -> dict[str, tuple[str, ...]]:
+        """Build per-step command templates using initialized decorator objects."""
+        from metaflow.runtime import CLIArgs as RuntimeCLIArgs
+
+        run_token = "__MF_RUN_ID__"
+        task_token = "__MF_TASK_ID__"
+        input_token = "__MF_INPUT_PATHS__"
+        retry_token = "__MF_RETRY_COUNT__"
+        max_retry_token = "__MF_MAX_USER_CODE_RETRIES__"
+        split_token = "__MF_SPLIT_INDEX__"
+
+        templates: dict[str, tuple[str, ...]] = {}
+        for step in spec.steps:
+            try:
+                node = self._graph[step.name]
+                task = type("_MFTask", (), {})()
+                task.entrypoint = [os.sys.executable, "-u", self._cfg.flow_file]
+                task.flow = self._flow
+                task.step = step.name
+                task.metadata_type = self._cfg.metadata_type
+                task.environment_type = self._cfg.environment_type
+                task.datastore_type = self._cfg.datastore_type
+                task.event_logger_type = self._cfg.event_logger_type
+                task.monitor_type = self._cfg.monitor_type
+                task.datastore_sysroot = self._cfg.datastore_root
+                task.decos = list(node.decorators)
+                task.run_id = run_token
+                task.task_id = task_token
+                task.input_paths = [input_token]
+                task.split_index = split_token
+                task.retries = retry_token
+                task.user_code_retries = max_retry_token
+                task.tags = list(spec.tags)
+                task.ubf_context = None
+                task.clone_run_id = None
+                task.is_cloned = False
+                task.clone_origin = None
+
+                for deco in task.decos:
+                    if hasattr(deco, "package_metadata") and not getattr(
+                        deco, "package_metadata", None
+                    ):
+                        deco.package_metadata = self._cfg.code_package_metadata
+                    if hasattr(deco, "package_sha") and not getattr(deco, "package_sha", None):
+                        deco.package_sha = self._cfg.code_package_sha
+                    if hasattr(deco, "package_url") and not getattr(deco, "package_url", None):
+                        deco.package_url = self._cfg.code_package_url
+
+                args = RuntimeCLIArgs(task)
+                with_opts = list(args.top_level_options.get("with") or [])
+                if "prefect_internal" not in with_opts:
+                    with_opts.append("prefect_internal")
+                for deco in self._cfg.with_decorators:
+                    if deco not in with_opts:
+                        with_opts.append(deco)
+                args.top_level_options["with"] = with_opts
+
+                for deco in task.decos:
+                    deco.runtime_step_cli(
+                        args,
+                        retry_count=0,
+                        max_user_code_retries=step.max_user_code_retries,
+                        ubf_context=None,
+                    )
+
+                args.command_options["run-id"] = run_token
+                args.command_options["task-id"] = task_token
+                args.command_options["input-paths"] = input_token
+                args.command_options["retry-count"] = retry_token
+                args.command_options["max-user-code-retries"] = max_retry_token
+                args.command_options["tag"] = list(spec.tags)
+                args.command_options["namespace"] = self._namespace or spec.namespace or ""
+                args.command_options["split-index"] = split_token
+
+                templates[step.name] = tuple(args.get_args())
+            except Exception:
+                continue
+
+        return templates
