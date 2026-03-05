@@ -115,6 +115,18 @@ def decorator_flow_graph() -> tuple[Any, Any]:
     return _load_flow_graph(str(FLOWS_DIR / "decorator_flow.py"))
 
 
+@pytest.fixture(scope="session")
+def resources_flow_graph() -> tuple[Any, Any]:
+    """(graph, flow) for ResourcesFlow (@resources on steps)."""
+    return _load_flow_graph(str(FLOWS_DIR / "resources_flow.py"))
+
+
+@pytest.fixture(scope="session")
+def required_param_flow_graph() -> tuple[Any, Any]:
+    """(graph, flow) for RequiredParamFlow (required parameter, no default)."""
+    return _load_flow_graph(str(FLOWS_DIR / "required_param_flow.py"))
+
+
 # ---------------------------------------------------------------------------
 # Mock Metaflow infrastructure objects
 # ---------------------------------------------------------------------------

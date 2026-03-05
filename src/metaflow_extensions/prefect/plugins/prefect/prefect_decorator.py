@@ -4,13 +4,14 @@ Auto-attached via ``--with=prefect_internal`` when Metaflow runs inside a
 Prefect task.  Responsibilities:
   - Records Prefect flow-run-id and task-run-id in Metaflow metadata so runs
     are cross-referenced between the two systems.
-  - Writes the foreach split-count to a side-car JSON file so the parent
-    Prefect task can fan out the body steps dynamically.
+
+Note: foreach split-count is read directly from the Metaflow datastore by the
+generated Prefect task after the subprocess completes, so no side-car file is
+needed here.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Any
 
@@ -22,10 +23,6 @@ from metaflow.metadata_provider import MetaDatum
 # ---------------------------------------------------------------------------
 ENV_FLOW_RUN_ID = "METAFLOW_PREFECT_FLOW_RUN_ID"
 ENV_TASK_RUN_ID = "METAFLOW_PREFECT_TASK_RUN_ID"
-
-# Path where foreach cardinality is written so the calling Prefect task can
-# read it back and fan out the body tasks.
-ENV_FOREACH_INFO_PATH = "METAFLOW_PREFECT_FOREACH_INFO_PATH"
 
 
 class PrefectInternalDecorator(StepDecorator):
@@ -66,23 +63,3 @@ class PrefectInternalDecorator(StepDecorator):
             for k, v in meta.items()
         ]
         metadata.register_metadata(run_id, step_name, task_id, entries)
-
-    def task_finished(
-        self,
-        step_name: str,
-        flow: Any,
-        graph: Any,
-        is_task_ok: bool,
-        retry_count: int,
-        max_user_code_retries: int,
-    ) -> None:
-        if not is_task_ok:
-            return
-
-        if graph[step_name].type == "foreach":
-            info_path = os.environ.get(ENV_FOREACH_INFO_PATH)
-            if info_path:
-                num_splits = getattr(flow, "_foreach_num_splits", None)
-                if num_splits is not None:
-                    with open(info_path, "w") as f:
-                        json.dump({"num_splits": int(num_splits)}, f)

@@ -7,7 +7,6 @@ from typing import Any
 import pytest
 
 from metaflow_extensions.prefect.plugins.prefect._codegen import (
-    _CB,
     _flow_signature,
     _python_name,
     _task_fn,
@@ -90,56 +89,6 @@ def _find_fn(tree: ast.Module, name: str) -> ast.FunctionDef | None:
 
 
 # ---------------------------------------------------------------------------
-# _CB tests
-# ---------------------------------------------------------------------------
-
-
-class TestCB:
-    def test_empty_build(self) -> None:
-        cb = _CB()
-        assert cb.build() == ""
-
-    def test_single_line(self) -> None:
-        cb = _CB()
-        cb.emit("hello")
-        assert cb.build() == "hello"
-
-    def test_blank_line(self) -> None:
-        cb = _CB()
-        cb.emit("a")
-        cb.emit()
-        cb.emit("b")
-        assert cb.build() == "a\n\nb"
-
-    def test_indent_dedent(self) -> None:
-        cb = _CB()
-        cb.emit("def f():")
-        cb.indent()
-        cb.emit("pass")
-        cb.dedent()
-        cb.emit("x = 1")
-        assert cb.build() == "def f():\n    pass\nx = 1"
-
-    def test_nested_indent(self) -> None:
-        cb = _CB()
-        cb.indent().emit("level1")
-        cb.indent().emit("level2")
-        cb.dedent().dedent().emit("level0")
-        assert cb.build() == "    level1\n        level2\nlevel0"
-
-    def test_dedent_below_zero_clamps(self) -> None:
-        cb = _CB()
-        cb.dedent()  # should not go negative
-        cb.emit("x")
-        assert cb.build() == "x"
-
-    def test_chaining(self) -> None:
-        cb = _CB()
-        result = cb.emit("a").emit("b").build()
-        assert result == "a\nb"
-
-
-# ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 
@@ -190,6 +139,12 @@ class TestFlowSignature:
         p = ParameterSpec(name="opt", default=None)
         sig = _flow_signature([p])
         assert "opt" in sig
+
+    def test_required_param_no_default_in_sig(self) -> None:
+        p = ParameterSpec(name="msg", default=None, type_name="str", required=True)
+        sig = _flow_signature([p])
+        assert "msg: str" in sig
+        assert "=" not in sig
 
     def test_multiple_params(self) -> None:
         params = [
@@ -259,15 +214,37 @@ class TestGeneratePrefectFileSimple:
     def test_helper_functions_present(self, src: str) -> None:
         tree = _parse(src)
         fns = _fn_names_at_module_level(tree)
-        assert "_foreach_info_path" in fns
-        assert "_read_foreach_info" in fns
+        assert "_read_foreach_num_splits" in fns
         assert "_run_cmd" in fns
         assert "_step_cmd" in fns
+        # Old temp-file helpers must NOT appear.
+        assert "_foreach_info_path" not in fns
+        assert "_read_foreach_info" not in fns
 
     def test_config_constants(self, src: str) -> None:
         assert "FLOW_FILE" in src
         assert "DATASTORE_TYPE" in src
         assert "METADATA_TYPE" in src
+        assert "CODE_PACKAGE_URL" in src
+        assert "CODE_PACKAGE_SHA" in src
+        assert "CODE_PACKAGE_METADATA" in src
+
+    def test_thread_pool_task_runner_imported(self, src: str) -> None:
+        assert "ThreadPoolTaskRunner" in src
+
+    def test_thread_pool_task_runner_in_flow_decorator(self, src: str) -> None:
+        flow_deco_line = next(
+            (line for line in src.splitlines() if line.startswith("@flow(")), None
+        )
+        assert flow_deco_line is not None
+        assert "ThreadPoolTaskRunner" in flow_deco_line
+
+    def test_max_workers_in_flow_decorator(self, src: str) -> None:
+        flow_deco_line = next(
+            (line for line in src.splitlines() if line.startswith("@flow(")), None
+        )
+        assert flow_deco_line is not None
+        assert "max_workers=" in flow_deco_line
 
 
 class TestGeneratePrefectFileBranch:
@@ -431,12 +408,24 @@ class TestGeneratePrefectFileConfig:
         spec = self._spec(simple_flow_graph)
         src = generate_prefect_file(spec, _make_cfg())
         # timeout_seconds should NOT appear in the @flow decorator when not set
-        import re
         flow_deco_line = next(
-            (l for l in src.splitlines() if l.startswith("@flow(")), None
+            (line for line in src.splitlines() if line.startswith("@flow(")), None
         )
         assert flow_deco_line is not None
         assert "timeout_seconds" not in flow_deco_line
+
+    def test_code_package_url_propagated(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(
+            spec, _make_cfg(code_package_url="s3://bucket/code.tgz")
+        )
+        assert "s3://bucket/code.tgz" in src
+        assert "--code-package-url" in src
+
+    def test_code_package_empty_by_default(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        spec = self._spec(simple_flow_graph)
+        src = generate_prefect_file(spec, _make_cfg())
+        assert "CODE_PACKAGE_URL: str = ''" in src
 
 
 class TestDecoratorCodegen:
@@ -478,6 +467,58 @@ class TestDecoratorCodegen:
         # The end step has no @environment decorator.
         # Count occurrences — only start has it, so exactly one update call.
         assert src.count("_extra_env.update(") == 1
+
+
+class TestResourcesComment:
+    """@resources values appear as a comment in the generated task body."""
+
+    @pytest.fixture
+    def src(self, resources_flow_graph: tuple[Any, Any]) -> str:
+        graph, flow = resources_flow_graph
+        spec = analyze_graph(graph, flow)
+        return generate_prefect_file(spec, _make_cfg())
+
+    def test_is_valid_python(self, src: str) -> None:
+        _parse(src)
+
+    def test_resources_comment_present(self, src: str) -> None:
+        assert "# NOTE: @resources(" in src
+        assert "cpu=4" in src
+        assert "memory=8192 MB" in src
+
+    def test_gpu_comment_present(self, src: str) -> None:
+        assert "gpu=1" in src
+
+
+class TestRequiredParamCodegen:
+    """Required parameters produce no default in the generated flow signature."""
+
+    @pytest.fixture
+    def src(self, required_param_flow_graph: tuple[Any, Any]) -> str:
+        graph, flow = required_param_flow_graph
+        spec = analyze_graph(graph, flow)
+        return generate_prefect_file(spec, _make_cfg())
+
+    def test_is_valid_python(self, src: str) -> None:
+        _parse(src)
+
+    def test_required_param_has_no_default(self, src: str) -> None:
+        tree = _parse(src)
+        fn = _find_fn(tree, "required_param_flow")
+        assert fn is not None
+        arg_names = [a.arg for a in fn.args.args]
+        assert "message" in arg_names
+        # The default list excludes args without defaults; required params appear
+        # before optional ones in the signature.
+        defaults = fn.args.defaults
+        args = fn.args.args
+        # args with defaults are the LAST len(defaults) args
+        required_args = args[: len(args) - len(defaults)]
+        required_names = {a.arg for a in required_args}
+        assert "message" in required_names
+
+    def test_optional_param_retains_default(self, src: str) -> None:
+        assert "count: int = 5" in src
 
 
 class TestForeachConcurrency:

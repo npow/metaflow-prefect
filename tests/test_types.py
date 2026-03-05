@@ -57,6 +57,25 @@ class TestStepSpec:
         assert spec.max_user_code_retries == 0
         assert spec.is_foreach_join is False
         assert spec.is_split_join is False
+        assert spec.resource_cpu is None
+        assert spec.resource_gpu is None
+        assert spec.resource_memory is None
+
+    def test_resource_fields(self) -> None:
+        """StepSpec stores resource hints from @resources."""
+        spec = StepSpec(
+            name="compute",
+            node_type=NodeType.LINEAR,
+            in_funcs=("start",),
+            out_funcs=("end",),
+            split_parents=(),
+            resource_cpu=4,
+            resource_gpu=1,
+            resource_memory=8192,
+        )
+        assert spec.resource_cpu == 4
+        assert spec.resource_gpu == 1
+        assert spec.resource_memory == 8192
 
     def test_flags_are_exclusive(self) -> None:
         """A step cannot be both a foreach-join and a split-join."""
@@ -90,6 +109,15 @@ class TestParameterSpec:
     def test_empty_description_default(self) -> None:
         p = ParameterSpec(name="x", default=1)
         assert p.description == ""
+
+    def test_required_defaults_false(self) -> None:
+        p = ParameterSpec(name="x", default="hi")
+        assert p.required is False
+
+    def test_required_true(self) -> None:
+        p = ParameterSpec(name="msg", default=None, type_name="str", required=True)
+        assert p.required is True
+        assert p.default is None
 
 
 class TestFlowSpec:

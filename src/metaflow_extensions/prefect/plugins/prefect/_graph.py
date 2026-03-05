@@ -89,6 +89,18 @@ def _validate(graph: Any, flow: Any) -> None:
                 raise NotSupportedException(
                     "Step *%s* uses @slurm which is not supported with Prefect." % node.name
                 )
+        # Nested foreach: a foreach whose split_parents contains another foreach.
+        if node.type == "foreach":
+            for ancestor_name in node.split_parents:
+                try:
+                    ancestor = graph[ancestor_name]
+                except Exception:
+                    continue
+                if ancestor.type == "foreach":
+                    raise NotSupportedException(
+                        "Nested foreach is not supported with Prefect deployments "
+                        "(step *%s* is a foreach inside another foreach)." % node.name
+                    )
 
     # Flow-level decorator checks
     for bad_deco in ("trigger", "trigger_on_finish", "exit_hook"):
@@ -143,6 +155,21 @@ def _step_env_vars(node: Any) -> tuple[tuple[str, str], ...]:
     return ()
 
 
+def _step_resources(node: Any) -> tuple[int | None, int | None, int | None]:
+    """Return (cpu, gpu, memory_mb) from @resources, or (None, None, None)."""
+    for deco in node.decorators:
+        if deco.name == "resources":
+            cpu = deco.attributes.get("cpu")
+            gpu = deco.attributes.get("gpu")
+            memory = deco.attributes.get("memory")
+            return (
+                int(cpu) if cpu is not None else None,
+                int(gpu) if gpu is not None else None,
+                int(memory) if memory is not None else None,
+            )
+    return (None, None, None)
+
+
 def _is_foreach_join(graph: Any, node: Any) -> bool:
     """True when *node* is a join step that closes a foreach."""
     if node.type != "join":
@@ -181,6 +208,7 @@ def _topological_order(graph: Any) -> list[StepSpec]:
 
         visited.add(name)
 
+        resource_cpu, resource_gpu, resource_memory = _step_resources(node)
         spec = StepSpec(
             name=node.name,
             node_type=NodeType(node.type),
@@ -193,6 +221,9 @@ def _topological_order(graph: Any) -> list[StepSpec]:
             timeout_seconds=_step_timeout_seconds(node),
             retry_delay_seconds=_step_retry_delay_seconds(node),
             env_vars=_step_env_vars(node),
+            resource_cpu=resource_cpu,
+            resource_gpu=resource_gpu,
+            resource_memory=resource_memory,
         )
         result.append(spec)
 
@@ -227,17 +258,34 @@ def _extract_parameters(flow: Any) -> list[ParameterSpec]:
     }
     params: list[ParameterSpec] = []
     for _, param in flow._get_parameters():
+        is_required = bool(_param_kwarg(param, "required"))
         raw_default = _param_kwarg(param, "default")
-        default = deploy_time_eval(raw_default)
-        type_name = _type_map.get(type(default).__name__, "str")
-        params.append(
-            ParameterSpec(
-                name=param.name,
-                default=default,
-                description=_param_kwarg(param, "help") or "",
-                type_name=type_name,
+
+        if is_required and raw_default is None:
+            # Infer type from the 'type' kwarg when there is no default.
+            type_arg = _param_kwarg(param, "type")
+            type_name = _type_map.get(getattr(type_arg, "__name__", "NoneType"), "str")
+            params.append(
+                ParameterSpec(
+                    name=param.name,
+                    default=None,
+                    description=_param_kwarg(param, "help") or "",
+                    type_name=type_name,
+                    required=True,
+                )
             )
-        )
+        else:
+            default = deploy_time_eval(raw_default)
+            type_name = _type_map.get(type(default).__name__, "str")
+            params.append(
+                ParameterSpec(
+                    name=param.name,
+                    default=default,
+                    description=_param_kwarg(param, "help") or "",
+                    type_name=type_name,
+                    required=False,
+                )
+            )
     return params
 
 
