@@ -208,6 +208,15 @@ names and a one-liner to fetch each value:
 Unsupported decorators (`@batch`, `@slurm`, `@trigger`, `@trigger_on_finish`, `@exit_hook`,
 `@parallel`) raise a clear error at compile time.
 
+## Limitations
+
+| Limitation | Detail |
+|---|---|
+| No `@condition` support | Metaflow's conditional branching (`@condition`) is not supported. Flows using it will produce incorrect generated code. |
+| No nested foreach | A `foreach` step inside another `foreach` raises an error at compile time. |
+| No `@parallel` foreach | `parallel_foreach=True` raises an error at compile time. |
+| `@resources` is advisory only | CPU/GPU/memory hints from `@resources` are emitted as comments in the generated file. You must configure matching resources on the Prefect work pool manually. |
+
 ## Development
 
 ```bash
