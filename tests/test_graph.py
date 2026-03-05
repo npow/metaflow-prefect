@@ -171,6 +171,39 @@ def _make_mock_graph(parallel_foreach: bool = False, deco_names: list[str] | Non
     return graph, flow
 
 
+def _make_nested_foreach_graph() -> tuple[Any, Any]:
+    """A (graph, flow) mock where a foreach step is inside another foreach."""
+    outer = MagicMock()
+    outer.name = "start"
+    outer.type = "foreach"
+    outer.parallel_foreach = False
+    outer.decorators = []
+    outer.in_funcs = []
+    outer.out_funcs = ["inner_foreach"]
+    outer.split_parents = []
+
+    inner = MagicMock()
+    inner.name = "inner_foreach"
+    inner.type = "foreach"
+    inner.parallel_foreach = False
+    inner.decorators = []
+    inner.in_funcs = ["start"]
+    inner.out_funcs = []
+    inner.split_parents = ["start"]  # start is an open foreach ancestor
+
+    graph = MagicMock()
+    graph.__iter__ = MagicMock(return_value=iter([outer, inner]))
+    graph.__getitem__ = MagicMock(
+        side_effect=lambda name: outer if name == "start" else inner
+    )
+
+    flow = MagicMock()
+    flow.name = "NestedForeachFlow"
+    flow._get_parameters = MagicMock(return_value=[])
+    flow._flow_decorators = {}
+    return graph, flow
+
+
 class TestValidation:
     """analyze_graph raises for unsupported features."""
 
@@ -209,6 +242,79 @@ class TestValidation:
         flow._flow_decorators = {"exit_hook": [e]}
         with pytest.raises(NotSupportedException, match="@exit_hook"):
             analyze_graph(graph, flow)
+
+    def test_nested_foreach_raises(self) -> None:
+        """A foreach step whose split_parents contains a foreach raises."""
+        graph, flow = _make_nested_foreach_graph()
+        with pytest.raises(NotSupportedException, match="[Nn]ested foreach"):
+            analyze_graph(graph, flow)
+
+
+class TestResourcesExtraction:
+    """StepSpec populated from @resources decorator."""
+
+    def test_cpu_extracted(self, resources_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = resources_flow_graph
+        spec = analyze_graph(graph, flow)
+        start = next(s for s in spec.steps if s.name == "start")
+        assert start.resource_cpu == 4
+
+    def test_memory_extracted(self, resources_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = resources_flow_graph
+        spec = analyze_graph(graph, flow)
+        start = next(s for s in spec.steps if s.name == "start")
+        assert start.resource_memory == 8192
+
+    def test_gpu_extracted(self, resources_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = resources_flow_graph
+        spec = analyze_graph(graph, flow)
+        end = next(s for s in spec.steps if s.name == "end")
+        assert end.resource_gpu == 1
+
+    def test_no_resources_on_plain_step(self, simple_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = simple_flow_graph
+        spec = analyze_graph(graph, flow)
+        for step in spec.steps:
+            assert step.resource_cpu is None
+            assert step.resource_gpu is None
+            assert step.resource_memory is None
+
+
+class TestRequiredParams:
+    """Required parameters (no default) handled correctly."""
+
+    def test_required_param_has_required_flag(
+        self, required_param_flow_graph: tuple[Any, Any]
+    ) -> None:
+        graph, flow = required_param_flow_graph
+        spec = analyze_graph(graph, flow)
+        msg = next(p for p in spec.parameters if p.name == "message")
+        assert msg.required is True
+
+    def test_required_param_default_is_none(
+        self, required_param_flow_graph: tuple[Any, Any]
+    ) -> None:
+        graph, flow = required_param_flow_graph
+        spec = analyze_graph(graph, flow)
+        msg = next(p for p in spec.parameters if p.name == "message")
+        assert msg.default is None
+
+    def test_optional_param_not_required(
+        self, required_param_flow_graph: tuple[Any, Any]
+    ) -> None:
+        graph, flow = required_param_flow_graph
+        spec = analyze_graph(graph, flow)
+        count = next(p for p in spec.parameters if p.name == "count")
+        assert count.required is False
+        assert count.default == 5
+
+    def test_required_param_type_inferred(
+        self, required_param_flow_graph: tuple[Any, Any]
+    ) -> None:
+        graph, flow = required_param_flow_graph
+        spec = analyze_graph(graph, flow)
+        msg = next(p for p in spec.parameters if p.name == "message")
+        assert msg.type_name == "str"
 
 
 class TestDecoratorExtraction:

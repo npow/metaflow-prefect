@@ -40,6 +40,9 @@ class StepSpec:
     timeout_seconds: int | None = None        # from @timeout(seconds=N)
     retry_delay_seconds: int | None = None    # from @retry(minutes_between_retries=N)
     env_vars: tuple[tuple[str, str], ...] = ()  # from @environment(vars={...})
+    resource_cpu: int | None = None            # from @resources(cpu=N)
+    resource_gpu: int | None = None            # from @resources(gpu=N)
+    resource_memory: int | None = None         # from @resources(memory=N) in MB
 
 
 @dataclass(frozen=True)
@@ -47,9 +50,10 @@ class ParameterSpec:
     """A single Metaflow flow parameter as seen at deploy time."""
 
     name: str
-    default: object                    # evaluated default value
+    default: object                    # evaluated default value; None when required=True
     description: str = ""
     type_name: str = "str"             # Python type name (str, int, float, bool)
+    required: bool = False             # True when Parameter(required=True) and no default
 
 
 @dataclass(frozen=True)

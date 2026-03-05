@@ -5,17 +5,24 @@
 self-contained Python file that, when executed, runs the Metaflow flow as a
 Prefect flow.
 
-Design constraints
-------------------
-- The generated file must be self-contained — no imports from this package.
-- It uses only stdlib + metaflow + prefect (already required by this package).
-- Linear, split/join, and foreach graph shapes are all handled.
-- Foreach body tasks run sequentially by default; users can switch to a
-  concurrent task-runner if they need parallel splits.
+Design
+------
+Code generation is split into four concerns, each returning a plain string:
+
+1. ``_build_header``  — compile-time constants (FLOW_NAME, DATASTORE_TYPE, …)
+2. ``_HELPERS``       — runtime helper functions, embedded verbatim
+3. ``_build_task``    — one ``@task`` function per Metaflow step
+4. ``_build_flow``    — the top-level ``@flow`` function that wires steps together
+
+Dynamic sections use the **lines-list** pattern: build a ``list[str]``, then
+``"\\n".join(lines)``.  This keeps the shape of the generated code visible
+when reading this file — no mental reconstruction from ``emit/indent/dedent``
+calls required.
 """
 
 from __future__ import annotations
 
+import textwrap
 from datetime import datetime
 from typing import Sequence
 
@@ -27,37 +34,170 @@ from metaflow_extensions.prefect.plugins.prefect._types import (
     StepSpec,
 )
 
-# ---------------------------------------------------------------------------
-# Tiny code-builder
-# ---------------------------------------------------------------------------
-
 _INDENT = "    "
 
+# ---------------------------------------------------------------------------
+# Static helper code — pasted verbatim into every generated file.
+#
+# These functions reference module-level constants (FLOW_NAME, DATASTORE_TYPE,
+# etc.) that are written by _build_header.  Because they are static they are
+# far more readable as a single string than as dozens of cb.emit() calls.
+# ---------------------------------------------------------------------------
 
-class _CB:
-    """Incrementally builds Python source, tracking indentation level."""
+_HELPERS = textwrap.dedent('''\
+    # ---------------------------------------------------------------------------
+    # Runtime helpers (embedded — no external imports needed)
+    # ---------------------------------------------------------------------------
 
-    def __init__(self) -> None:
-        self._lines: list[str] = []
-        self._level: int = 0
+    def _read_foreach_num_splits(run_id: str, step_name: str, task_id: str) -> int:
+        """Read foreach split count from the Metaflow datastore after step completes."""
+        try:
+            from metaflow.datastore import FlowDataStore
+            from metaflow.plugins import DATASTORES
+            _impl = next(d for d in DATASTORES if d.TYPE == DATASTORE_TYPE)
+            _root = _impl.get_datastore_root_from_config(lambda *a: None)
+            _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
+            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
+            return int(_tds["_foreach_num_splits"])
+        except Exception as _e:
+            raise RuntimeError(
+                f"Could not read foreach split count for {step_name}/{task_id}: {_e}"
+            ) from _e
 
-    # -- public API ----------------------------------------------------------
 
-    def emit(self, line: str = "") -> "_CB":
-        pad = _INDENT * self._level
-        self._lines.append(pad + line if line else "")
-        return self
+    def _run_cmd(cmd: list[str], extra_env: dict[str, str] | None = None) -> None:
+        """Execute cmd as a subprocess, inheriting stdout/stderr."""
+        env = os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
+        subprocess.run(cmd, env=env, check=True)
 
-    def indent(self) -> "_CB":
-        self._level += 1
-        return self
 
-    def dedent(self) -> "_CB":
-        self._level = max(0, self._level - 1)
-        return self
+    def _mf_artifact_names(run_id: str, step_name: str, task_id: str) -> list[str]:
+        """Return user-defined artifact names from the Metaflow datastore (no values loaded)."""
+        try:
+            from metaflow.datastore import FlowDataStore
+            from metaflow.plugins import DATASTORES
+            _impl = next(d for d in DATASTORES if d.TYPE == DATASTORE_TYPE)
+            _root = _impl.get_datastore_root_from_config(lambda *a: None)
+            _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
+            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
+            _SKIP = {"name", "input"}  # Metaflow internal artifact names
+            return [n for n in _tds if not n.startswith("_") and n not in _SKIP]
+        except Exception:
+            return []
 
-    def build(self) -> str:
-        return "\n".join(self._lines)
+
+    def _fallback_step_cmd(
+        step_name: str,
+        run_id: str,
+        task_id: str,
+        input_paths: str,
+        retry_count: int = 0,
+        max_user_code_retries: int = 0,
+        split_index: int | None = None,
+    ) -> list[str]:
+        """Conservative fallback command when decorator-aware resolution fails."""
+        cmd: list[str] = [
+            sys.executable, FLOW_FILE,
+            "--datastore", DATASTORE_TYPE,
+            "--metadata", METADATA_TYPE,
+            "--no-pylint",
+            "--with=prefect_internal",
+            "step", step_name,
+            "--run-id", run_id,
+            "--task-id", task_id,
+            "--retry-count", str(retry_count),
+            "--max-user-code-retries", str(max_user_code_retries),
+            "--input-paths", input_paths,
+        ]
+        for _tag in TAGS:
+            cmd += ["--tag", _tag]
+        for _deco in WITH_DECORATORS:
+            cmd += [f"--with={_deco}"]
+        if NAMESPACE:
+            cmd += ["--namespace", NAMESPACE]
+        if split_index is not None:
+            cmd += ["--split-index", str(split_index)]
+        if CODE_PACKAGE_URL:
+            cmd += ["--code-package-url", CODE_PACKAGE_URL]
+        if CODE_PACKAGE_SHA:
+            cmd += ["--code-package-sha", CODE_PACKAGE_SHA]
+        if CODE_PACKAGE_METADATA:
+            cmd += ["--code-package-metadata", CODE_PACKAGE_METADATA]
+        return cmd
+
+
+    def _materialize_cmd(
+        template: tuple[str, ...],
+        run_id: str,
+        task_id: str,
+        input_paths: str,
+        retry_count: int,
+        max_user_code_retries: int,
+        split_index: int | None,
+    ) -> list[str]:
+        """Apply runtime values to a compile-time command template."""
+        run_token = "__MF_RUN_ID__"
+        task_token = "__MF_TASK_ID__"
+        input_token = "__MF_INPUT_PATHS__"
+        retry_token = "__MF_RETRY_COUNT__"
+        max_retry_token = "__MF_MAX_USER_CODE_RETRIES__"
+        split_token = "__MF_SPLIT_INDEX__"
+        out: list[str] = []
+        i = 0
+        while i < len(template):
+            tok = template[i]
+            if tok == "--split-index" and i + 1 < len(template) and template[i + 1] == split_token:
+                if split_index is None:
+                    i += 2
+                    continue
+                out.append(tok)
+                out.append(str(split_index))
+                i += 2
+                continue
+            if tok == run_token:
+                out.append(run_id)
+            elif tok == task_token:
+                out.append(task_id)
+            elif tok == input_token:
+                out.append(input_paths)
+            elif tok == retry_token:
+                out.append(str(retry_count))
+            elif tok == max_retry_token:
+                out.append(str(max_user_code_retries))
+            elif tok == split_token:
+                if split_index is not None:
+                    out.append(str(split_index))
+            else:
+                out.append(tok)
+            i += 1
+        return out
+
+
+    def _step_cmd(
+        step_name: str,
+        run_id: str,
+        task_id: str,
+        input_paths: str,
+        retry_count: int = 0,
+        max_user_code_retries: int = 0,
+        split_index: int | None = None,
+    ) -> list[str]:
+        """Build a Metaflow step command honoring compile-time decorator state."""
+        template = STEP_CMD_TEMPLATES.get(step_name)
+        if template:
+            return _materialize_cmd(
+                template, run_id, task_id, input_paths, retry_count,
+                max_user_code_retries, split_index,
+            )
+        return _fallback_step_cmd(
+            step_name, run_id, task_id, input_paths,
+            retry_count=retry_count,
+            max_user_code_retries=max_user_code_retries,
+            split_index=split_index,
+        )
+''')
 
 
 # ---------------------------------------------------------------------------
@@ -70,309 +210,92 @@ def generate_prefect_file(
     cfg: PrefectFlowConfig,
     cmd_templates: dict[str, tuple[str, ...]] | None = None,
 ) -> str:
-    """Return the full Python source of a runnable Prefect flow file.
-
-    Args:
-        spec: Analysed flow description (from ``_graph.analyze_graph``).
-        cfg:  User-supplied deployment configuration.
-
-    Returns:
-        A multi-line Python source string ready to be written to disk.
-    """
-    cb = _CB()
-    _emit_header(cb, spec, cfg, cmd_templates or {})
-    _emit_helpers(cb, cfg)
+    """Return the full Python source of a runnable Prefect flow file."""
+    sections: list[str] = [
+        _build_header(spec, cfg, cmd_templates or {}),
+        _HELPERS,
+    ]
     for step in spec.steps:
-        cb.emit()
-        cb.emit()
-        _emit_task(cb, step, spec, cfg)
-    cb.emit()
-    cb.emit()
-    _emit_flow(cb, spec, cfg)
-    cb.emit()
-    cb.emit("if __name__ == '__main__':")
-    cb.indent()
-    cb.emit("%s()" % _python_name(spec.name))
-    cb.dedent()
-    return cb.build()
+        sections.append(_build_task(step, spec, cfg))
+    sections.append(_build_flow(spec, cfg))
+    main_guard = "if __name__ == '__main__':\n" + _INDENT + "%s()" % _python_name(spec.name)
+    sections.append(main_guard)
+    return "\n\n".join(sections)
 
 
 # ---------------------------------------------------------------------------
-# Header + helpers block
+# Section 1 — header constants
 # ---------------------------------------------------------------------------
 
 
-def _emit_header(
-    cb: _CB, spec: FlowSpec, cfg: PrefectFlowConfig, cmd_templates: dict[str, tuple[str, ...]]
-) -> None:
-    cb.emit("# Generated by metaflow-prefect on %s" % datetime.now().isoformat(timespec="seconds"))
-    cb.emit("# Metaflow flow: %s" % spec.name)
-    cb.emit("# Do not edit this file — regenerate with: python %s prefect create <file>" % cfg.flow_file)
-    cb.emit()
-    cb.emit("from __future__ import annotations")
-    cb.emit()
-    cb.emit("import json")
-    cb.emit("import os")
-    cb.emit("import subprocess")
-    cb.emit("import sys")
-    cb.emit("import tempfile")
-    cb.emit("import uuid")
-    cb.emit("from typing import Any")
-    cb.emit()
-    cb.emit("from prefect import flow, task, get_run_logger")
-    cb.emit("from prefect.artifacts import create_markdown_artifact")
-    cb.emit("from prefect.context import get_run_context")
-    cb.emit()
-    cb.emit("# ---------------------------------------------------------------------------")
-    cb.emit("# Compile-time configuration")
-    cb.emit("# ---------------------------------------------------------------------------")
-    cb.emit("FLOW_FILE: str = %r" % cfg.flow_file)
-    cb.emit("FLOW_NAME: str = %r" % spec.name)
-    cb.emit("DATASTORE_TYPE: str = %r" % cfg.datastore_type)
-    cb.emit("METADATA_TYPE: str = %r" % cfg.metadata_type)
-    cb.emit("ENVIRONMENT_TYPE: str = %r" % cfg.environment_type)
-    cb.emit("EVENT_LOGGER_TYPE: str = %r" % cfg.event_logger_type)
-    cb.emit("MONITOR_TYPE: str = %r" % cfg.monitor_type)
-    cb.emit("DATASTORE_ROOT: str | None = %r" % cfg.datastore_root)
-    cb.emit("CODE_PACKAGE_URL: str = %r" % cfg.code_package_url)
-    cb.emit("CODE_PACKAGE_SHA: str = %r" % cfg.code_package_sha)
-    cb.emit("CODE_PACKAGE_METADATA: str = %r" % cfg.code_package_metadata)
-    cb.emit("USERNAME: str = %r" % cfg.username)
-    cb.emit("TAGS: list[str] = %r" % list(spec.tags))
-    cb.emit("NAMESPACE: str | None = %r" % spec.namespace)
-    cb.emit("SCHEDULE_CRON: str | None = %r" % spec.schedule_cron)
-    cb.emit("WITH_DECORATORS: list[str] = %r" % list(cfg.with_decorators))
-    cb.emit("STEP_CMD_TEMPLATES: dict[str, tuple[str, ...]] = %r" % dict(cmd_templates))
-
-
-def _emit_helpers(cb: _CB, cfg: PrefectFlowConfig) -> None:
-    cb.emit()
-    cb.emit()
-    cb.emit("# ---------------------------------------------------------------------------")
-    cb.emit("# Runtime helpers (embedded — no external imports needed)")
-    cb.emit("# ---------------------------------------------------------------------------")
-    cb.emit()
-    cb.emit("def _foreach_info_path(run_id: str, step_name: str) -> str:")
-    cb.indent()
-    cb.emit('"""Return the temp file path where foreach cardinality is written."""')
-    cb.emit("safe_run = run_id.replace('/', '_').replace(':', '_')")
-    cb.emit("return os.path.join(tempfile.gettempdir(), f'mf_prefect_foreach_{safe_run}_{step_name}.json')")
-    cb.dedent()
-    cb.emit()
-    cb.emit()
-    cb.emit("def _read_foreach_info(path: str) -> int:")
-    cb.indent()
-    cb.emit('"""Read foreach split-count written by the prefect_internal decorator."""')
-    cb.emit("try:")
-    cb.indent()
-    cb.emit("with open(path) as _f:")
-    cb.indent()
-    cb.emit("return int(json.load(_f)['num_splits'])")
-    cb.dedent()
-    cb.dedent()
-    cb.emit("except Exception:")
-    cb.indent()
-    cb.emit("return 0")
-    cb.dedent()
-    cb.dedent()
-    cb.emit()
-    cb.emit()
-    cb.emit("def _run_cmd(cmd: list[str], extra_env: dict[str, str] | None = None) -> None:")
-    cb.indent()
-    cb.emit('"""Execute *cmd* as a subprocess, inheriting stdout/stderr."""')
-    cb.emit("env = os.environ.copy()")
-    cb.emit("if extra_env:")
-    cb.indent()
-    cb.emit("env.update(extra_env)")
-    cb.dedent()
-    cb.emit("subprocess.run(cmd, env=env, check=True)")
-    cb.dedent()
-    cb.emit()
-    cb.emit()
-    cb.emit("def _mf_artifact_names(run_id: str, step_name: str, task_id: str) -> list[str]:")
-    cb.indent()
-    cb.emit('"""Return user-defined artifact names from the Metaflow datastore (no values loaded)."""')
-    cb.emit("try:")
-    cb.indent()
-    cb.emit("from metaflow.datastore import FlowDataStore")
-    cb.emit("from metaflow.plugins import DATASTORES")
-    cb.emit("_impl = next(d for d in DATASTORES if d.TYPE == DATASTORE_TYPE)")
-    cb.emit("_root = _impl.get_datastore_root_from_config(lambda *a: None)")
-    cb.emit("_fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)")
-    cb.emit("_tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode='r')")
-    cb.emit("_SKIP = {'name', 'input'}  # Metaflow internal artifact names")
-    cb.emit("return [n for n in _tds if not n.startswith('_') and n not in _SKIP]")
-    cb.dedent()
-    cb.emit("except Exception:")
-    cb.indent()
-    cb.emit("return []")
-    cb.dedent()
-    cb.dedent()
-    cb.emit()
-    cb.emit()
-    cb.emit("def _fallback_step_cmd(")
-    cb.indent()
-    cb.emit("step_name: str,")
-    cb.emit("run_id: str,")
-    cb.emit("task_id: str,")
-    cb.emit("input_paths: str,")
-    cb.emit("retry_count: int = 0,")
-    cb.emit("max_user_code_retries: int = 0,")
-    cb.emit("split_index: int | None = None,")
-    cb.dedent()
-    cb.emit(") -> list[str]:")
-    cb.indent()
-    cb.emit('"""Conservative fallback command when decorator-aware resolution fails."""')
-    cb.emit("cmd: list[str] = [")
-    cb.indent()
-    cb.emit("sys.executable, FLOW_FILE,")
-    cb.emit('"--datastore", DATASTORE_TYPE,')
-    cb.emit('"--metadata", METADATA_TYPE,')
-    cb.emit('"--no-pylint",')
-    cb.emit('"--with=prefect_internal",')
-    cb.emit('"step", step_name,')
-    cb.emit('"--run-id", run_id,')
-    cb.emit('"--task-id", task_id,')
-    cb.emit('"--retry-count", str(retry_count),')
-    cb.emit('"--max-user-code-retries", str(max_user_code_retries),')
-    cb.emit('"--input-paths", input_paths,')
-    cb.dedent()
-    cb.emit("]")
-    cb.emit("for _tag in TAGS:")
-    cb.indent()
-    cb.emit('cmd += ["--tag", _tag]')
-    cb.dedent()
-    cb.emit("for _deco in WITH_DECORATORS:")
-    cb.indent()
-    cb.emit('cmd += [f"--with={_deco}"]')
-    cb.dedent()
-    cb.emit("if NAMESPACE:")
-    cb.indent()
-    cb.emit('cmd += ["--namespace", NAMESPACE]')
-    cb.dedent()
-    cb.emit("if split_index is not None:")
-    cb.indent()
-    cb.emit('cmd += ["--split-index", str(split_index)]')
-    cb.dedent()
-    cb.emit("return cmd")
-    cb.dedent()
-    cb.emit()
-    cb.emit()
-    cb.emit("def _materialize_cmd(")
-    cb.indent()
-    cb.emit("template: tuple[str, ...],")
-    cb.emit("run_id: str,")
-    cb.emit("task_id: str,")
-    cb.emit("input_paths: str,")
-    cb.emit("retry_count: int,")
-    cb.emit("max_user_code_retries: int,")
-    cb.emit("split_index: int | None,")
-    cb.dedent()
-    cb.emit(") -> list[str]:")
-    cb.indent()
-    cb.emit('"""Apply runtime values to a compile-time command template."""')
-    cb.emit("run_token = '__MF_RUN_ID__'")
-    cb.emit("task_token = '__MF_TASK_ID__'")
-    cb.emit("input_token = '__MF_INPUT_PATHS__'")
-    cb.emit("retry_token = '__MF_RETRY_COUNT__'")
-    cb.emit("max_retry_token = '__MF_MAX_USER_CODE_RETRIES__'")
-    cb.emit("split_token = '__MF_SPLIT_INDEX__'")
-    cb.emit("out: list[str] = []")
-    cb.emit("i = 0")
-    cb.emit("while i < len(template):")
-    cb.indent()
-    cb.emit("tok = template[i]")
-    cb.emit("if tok == '--split-index' and i + 1 < len(template) and template[i + 1] == split_token:")
-    cb.indent()
-    cb.emit("if split_index is None:")
-    cb.indent()
-    cb.emit("i += 2")
-    cb.emit("continue")
-    cb.dedent()
-    cb.emit("out.append(tok)")
-    cb.emit("out.append(str(split_index))")
-    cb.emit("i += 2")
-    cb.emit("continue")
-    cb.dedent()
-    cb.emit("if tok == run_token:")
-    cb.indent()
-    cb.emit("out.append(run_id)")
-    cb.dedent()
-    cb.emit("elif tok == task_token:")
-    cb.indent()
-    cb.emit("out.append(task_id)")
-    cb.dedent()
-    cb.emit("elif tok == input_token:")
-    cb.indent()
-    cb.emit("out.append(input_paths)")
-    cb.dedent()
-    cb.emit("elif tok == retry_token:")
-    cb.indent()
-    cb.emit("out.append(str(retry_count))")
-    cb.dedent()
-    cb.emit("elif tok == max_retry_token:")
-    cb.indent()
-    cb.emit("out.append(str(max_user_code_retries))")
-    cb.dedent()
-    cb.emit("elif tok == split_token:")
-    cb.indent()
-    cb.emit("if split_index is not None:")
-    cb.indent()
-    cb.emit("out.append(str(split_index))")
-    cb.dedent()
-    cb.dedent()
-    cb.emit("else:")
-    cb.indent()
-    cb.emit("out.append(tok)")
-    cb.dedent()
-    cb.emit("i += 1")
-    cb.dedent()
-    cb.emit("return out")
-    cb.dedent()
-    cb.emit()
-    cb.emit()
-    cb.emit("def _step_cmd(")
-    cb.indent()
-    cb.emit("step_name: str,")
-    cb.emit("run_id: str,")
-    cb.emit("task_id: str,")
-    cb.emit("input_paths: str,")
-    cb.emit("retry_count: int = 0,")
-    cb.emit("max_user_code_retries: int = 0,")
-    cb.emit("split_index: int | None = None,")
-    cb.dedent()
-    cb.emit(") -> list[str]:")
-    cb.indent()
-    cb.emit('"""Build a Metaflow step command honoring compile-time decorator state."""')
-    cb.emit("template = STEP_CMD_TEMPLATES.get(step_name)")
-    cb.emit("if template:")
-    cb.indent()
-    cb.emit("return _materialize_cmd(")
-    cb.indent()
-    cb.emit("template, run_id, task_id, input_paths, retry_count,")
-    cb.emit("max_user_code_retries, split_index,")
-    cb.dedent()
-    cb.emit(")")
-    cb.dedent()
-    cb.emit("return _fallback_step_cmd(")
-    cb.indent()
-    cb.emit("step_name, run_id, task_id, input_paths,")
-    cb.emit("retry_count=retry_count,")
-    cb.emit("max_user_code_retries=max_user_code_retries,")
-    cb.emit("split_index=split_index,")
-    cb.dedent()
-    cb.emit(")")
-    cb.dedent()
-    cb.dedent()
+def _build_header(
+    spec: FlowSpec,
+    cfg: PrefectFlowConfig,
+    cmd_templates: dict[str, tuple[str, ...]] | None = None,
+) -> str:
+    lines = [
+        "# Generated by metaflow-prefect on %s" % datetime.now().isoformat(timespec="seconds"),
+        "# Metaflow flow: %s" % spec.name,
+        "# Do not edit this file — regenerate with: python %s prefect create <file>" % cfg.flow_file,
+        "",
+        "from __future__ import annotations",
+        "",
+        "import json",
+        "import os",
+        "import subprocess",
+        "import sys",
+        "import uuid",
+        "from typing import Any",
+        "",
+        "from prefect import flow, task, get_run_logger",
+        "from prefect.artifacts import create_markdown_artifact",
+        "from prefect.context import get_run_context",
+        "from prefect.task_runners import ThreadPoolTaskRunner",
+        "",
+        "# ---------------------------------------------------------------------------",
+        "# Compile-time configuration",
+        "# ---------------------------------------------------------------------------",
+        "FLOW_FILE: str = %r" % cfg.flow_file,
+        "FLOW_NAME: str = %r" % spec.name,
+        "DATASTORE_TYPE: str = %r" % cfg.datastore_type,
+        "METADATA_TYPE: str = %r" % cfg.metadata_type,
+        "ENVIRONMENT_TYPE: str = %r" % cfg.environment_type,
+        "EVENT_LOGGER_TYPE: str = %r" % cfg.event_logger_type,
+        "MONITOR_TYPE: str = %r" % cfg.monitor_type,
+        "DATASTORE_ROOT: str | None = %r" % cfg.datastore_root,
+        "CODE_PACKAGE_URL: str = %r" % cfg.code_package_url,
+        "CODE_PACKAGE_SHA: str = %r" % cfg.code_package_sha,
+        "CODE_PACKAGE_METADATA: str = %r" % cfg.code_package_metadata,
+        "USERNAME: str = %r" % cfg.username,
+        "TAGS: list[str] = %r" % list(spec.tags),
+        "NAMESPACE: str | None = %r" % spec.namespace,
+        "SCHEDULE_CRON: str | None = %r" % spec.schedule_cron,
+        "WITH_DECORATORS: list[str] = %r" % list(cfg.with_decorators),
+        "STEP_CMD_TEMPLATES: dict[str, tuple[str, ...]] = %r" % dict(cmd_templates or {}),
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Per-step @task functions
+# Section 3 — per-step @task functions
 # ---------------------------------------------------------------------------
+
+
+def _build_task(step: StepSpec, spec: FlowSpec, cfg: PrefectFlowConfig) -> str:
+    """Return the full source of the @task function for one Metaflow step."""
+    body = _task_body_lines(step, spec)
+    indented_body = [_INDENT + line if line else "" for line in body]
+    return "\n".join([
+        _task_decorator(step),
+        "def %s(%s) -> %s:" % (
+            _task_fn(step.name),
+            _task_signature(step, spec),
+            _task_return_type(step),
+        ),
+    ] + indented_body)
 
 
 def _task_decorator(step: StepSpec) -> str:
-    """Build the @task(...) decorator string for *step*."""
     parts = ['name="%s"' % step.name, "retries=%d" % step.max_user_code_retries]
     if step.timeout_seconds is not None:
         parts.append("timeout_seconds=%d" % step.timeout_seconds)
@@ -381,290 +304,314 @@ def _task_decorator(step: StepSpec) -> str:
     return "@task(%s)" % ", ".join(parts)
 
 
-def _emit_task(cb: _CB, step: StepSpec, spec: FlowSpec, cfg: PrefectFlowConfig) -> None:
-    """Emit the ``@task`` function for *step*."""
-    cb.emit(_task_decorator(step))
-
-    # The Metaflow "start" step always has step.name == "start".  Its
-    # node_type may be START (linear), FOREACH, or SPLIT depending on how
-    # self.next() is called — so we use the name, not the type, to detect it.
+def _task_signature(step: StepSpec, spec: FlowSpec) -> str:
+    """Return the parameter list string for the @task function."""
     is_start = step.name == "start"
-
-    # Immediate child of a FOREACH node: needs split_index to select its item.
-    _foreach_body_set = {
+    foreach_body_steps = {
         s.out_funcs[0]
         for s in spec.steps
         if s.node_type == NodeType.FOREACH and s.out_funcs
     }
-    is_foreach_body = step.name in _foreach_body_set
-
-    # --- function signature ---
-    if is_start and step.node_type == NodeType.FOREACH:
-        # start step that also fans out via foreach= → returns (task_id, num_splits)
-        cb.emit("def %s(run_id: str, parameters: dict[str, Any]) -> tuple[str, int]:" % _task_fn(step.name))
-    elif is_start:
-        # start step with linear or split next → returns task_id
-        cb.emit("def %s(run_id: str, parameters: dict[str, Any]) -> str:" % _task_fn(step.name))
-    elif step.is_foreach_join:
-        cb.emit("def %s(run_id: str, parent_step: str, task_ids: list[str]) -> str:" % _task_fn(step.name))
-    elif step.is_split_join:
-        cb.emit("def %s(run_id: str, parent_task_ids: dict[str, str]) -> str:" % _task_fn(step.name))
-    elif step.node_type == NodeType.FOREACH:
-        cb.emit("def %s(run_id: str, prev_task_id: str) -> tuple[str, int]:" % _task_fn(step.name))
-    elif is_foreach_body:
-        # body step of a foreach: receives split_index from the list comprehension
-        cb.emit("def %s(run_id: str, prev_task_id: str, split_index: int = 0) -> str:" % _task_fn(step.name))
-    else:
-        # linear, split, end
-        cb.emit("def %s(run_id: str, prev_task_id: str) -> str:" % _task_fn(step.name))
-
-    cb.indent()
-    cb.emit('logger = get_run_logger()')
-    cb.emit("task_id: str = uuid.uuid4().hex[:16]")
-
-    # --- build input_paths ---
-    # Each path is run_id/step_name/task_id — comma-separated for joins.
     if is_start:
-        _emit_start_init(cb, spec)
-        cb.emit("input_paths: str = f\"{run_id}/_parameters/{param_task_id}\"")
-    elif step.is_foreach_join:
-        # All body task outputs share the same parent step name.
-        cb.emit(
-            "input_paths: str = \",\".join("
-            "f\"{run_id}/{parent_step}/{tid}\" for tid in task_ids)"
+        return "run_id: str, parameters: dict[str, Any]"
+    if step.is_foreach_join:
+        return "run_id: str, parent_step: str, task_ids: list[str]"
+    if step.is_split_join:
+        return "run_id: str, parent_task_ids: dict[str, str]"
+    if step.name in foreach_body_steps:
+        return "run_id: str, prev_task_id: str, split_index: int = 0"
+    return "run_id: str, prev_task_id: str"
+
+
+def _task_return_type(step: StepSpec) -> str:
+    if step.node_type == NodeType.FOREACH:
+        return "tuple[str, int]"
+    return "str"
+
+
+def _task_body_lines(step: StepSpec, spec: FlowSpec) -> list[str]:
+    """Return the unindented body lines for a @task function."""
+    is_start = step.name == "start"
+    foreach_body_steps = {
+        s.out_funcs[0]
+        for s in spec.steps
+        if s.node_type == NodeType.FOREACH and s.out_funcs
+    }
+    is_foreach_body = step.name in foreach_body_steps
+
+    lines: list[str] = []
+    lines.append("logger = get_run_logger()")
+
+    # Resource hint comment — users must configure this at the Prefect work pool.
+    resource_parts = []
+    if step.resource_cpu is not None:
+        resource_parts.append("cpu=%d" % step.resource_cpu)
+    if step.resource_gpu is not None:
+        resource_parts.append("gpu=%d" % step.resource_gpu)
+    if step.resource_memory is not None:
+        resource_parts.append("memory=%d MB" % step.resource_memory)
+    if resource_parts:
+        lines.append(
+            "# NOTE: @resources(%s) — configure matching resources at the Prefect work pool."
+            % ", ".join(resource_parts)
         )
-    elif step.is_split_join:
-        # One path per branch: run_id/branch_step/task_id
-        parts = "\",\".join([" + ", ".join(
-            'f"{run_id}/%s/{parent_task_ids[%r]}"' % (p, p) for p in step.in_funcs
-        ) + "])"
-        cb.emit("input_paths: str = %s" % parts)
-    else:
-        # single upstream: run_id/parent_step/prev_task_id
-        parent = step.in_funcs[0] if step.in_funcs else "start"
-        cb.emit("input_paths: str = f\"{run_id}/%s/{prev_task_id}\"" % parent)
 
-    # --- foreach side-car setup ---
-    if step.node_type == NodeType.FOREACH:
-        cb.emit("foreach_path: str = _foreach_info_path(run_id, %r)" % step.name)
-        cb.emit("_extra_env: dict[str, str] = {'METAFLOW_PREFECT_FOREACH_INFO_PATH': foreach_path}")
-    else:
-        cb.emit("_extra_env: dict[str, str] = {}")
+    lines.append("task_id: str = uuid.uuid4().hex[:16]")
+    lines.append("_extra_env: dict[str, str] = {}")
+    lines += _ctx_inject_lines()
 
-    # --- inject Prefect context into subprocess env ---
-    cb.emit("try:")
-    cb.indent()
-    cb.emit("_ctx = get_run_context()")
-    cb.emit("_extra_env['METAFLOW_PREFECT_FLOW_RUN_ID'] = str(_ctx.flow_run.id)")
-    cb.emit("_extra_env['METAFLOW_PREFECT_TASK_RUN_ID'] = str(_ctx.task_run.id)")
-    cb.dedent()
-    cb.emit("except Exception:")
-    cb.indent()
-    cb.emit("pass")
-    cb.dedent()
-
-    # --- @environment vars: merge into subprocess env ---
     if step.env_vars:
-        cb.emit("_extra_env.update(%r)" % dict(step.env_vars))
+        lines.append("_extra_env.update(%r)" % dict(step.env_vars))
 
-    # --- run the step ---
-    cb.emit("logger.info(f\"Metaflow step '%s' task_id={task_id}\")" % step.name)
-    cb.emit("cmd = _step_cmd(")
-    cb.indent()
-    cb.emit("%r, run_id, task_id, input_paths," % step.name)
-    cb.emit("max_user_code_retries=%d," % step.max_user_code_retries)
+    # For the start step, the init command runs first and defines param_task_id,
+    # which input_paths then references.  For all other steps the assignment is safe.
+    if is_start:
+        lines += _start_init_lines(spec)
+
+    lines.append(_input_paths_line(step, spec))
+
+    lines.append('logger.info(f"Metaflow step \'%s\' task_id={task_id}")' % step.name)
+    lines.append("cmd = _step_cmd(")
+    lines.append(_INDENT + "%r, run_id, task_id, input_paths," % step.name)
+    lines.append(_INDENT + "max_user_code_retries=%d," % step.max_user_code_retries)
     if is_foreach_body:
-        cb.emit("split_index=split_index,")
-    cb.dedent()
-    cb.emit(")")
-    cb.emit("_run_cmd(cmd, extra_env=_extra_env)")
+        lines.append(_INDENT + "split_index=split_index,")
+    lines.append(")")
+    lines.append("_run_cmd(cmd, extra_env=_extra_env)")
+    lines += _artifact_lines(step)
 
-    # --- Prefect artifact: list Metaflow self.* keys + retrieval snippet ---
-    artifact_key = step.name.replace("_", "-")
-    cb.emit("_art_names = _mf_artifact_names(run_id, %r, task_id)" % step.name)
-    cb.emit("_md = f\"## `%s` — {run_id}\\n\\n\"" % step.name)
-    cb.emit("if _art_names:")
-    cb.indent()
-    cb.emit("for _n in _art_names:")
-    cb.indent()
-    cb.emit("_md += f\"`{_n}`\\n\"")
-    cb.emit("_md += \"```python\\n\"")
-    cb.emit("_md += f\"Task('{FLOW_NAME}/{run_id}/%s/{task_id}')['{_n}'].data\\n\"" % step.name)
-    cb.emit("_md += \"```\\n\\n\"")
-    cb.dedent()
-    cb.dedent()
-    cb.emit("else:")
-    cb.indent()
-    cb.emit("_md += \"*(no user artifacts)*\\n\"")
-    cb.dedent()
-    cb.emit("create_markdown_artifact(key=%r, markdown=_md)" % artifact_key)
-
-    # --- return value ---
     if step.node_type == NodeType.FOREACH:
-        cb.emit("num_splits: int = _read_foreach_info(foreach_path)")
-        cb.emit("return task_id, num_splits")
+        lines.append("num_splits: int = _read_foreach_num_splits(run_id, %r, task_id)" % step.name)
+        lines.append("return task_id, num_splits")
     else:
-        cb.emit("return task_id")
+        lines.append("return task_id")
 
-    cb.dedent()
+    return lines
 
 
-def _emit_start_init(cb: _CB, spec: FlowSpec) -> None:
-    """Emit the _parameters init call inside the start task."""
-    cb.emit("# --- _parameters init task ---")
-    cb.emit("param_task_id: str = uuid.uuid4().hex[:16]")
-    cb.emit("init_cmd: list[str] = [")
-    cb.indent()
-    cb.emit("sys.executable, FLOW_FILE,")
-    cb.emit('"--datastore", DATASTORE_TYPE,')
-    cb.emit('"--metadata", METADATA_TYPE,')
-    cb.emit('"--no-pylint",')
-    cb.emit('"init",')
-    cb.emit('"--run-id", run_id,')
-    cb.emit('"--task-id", param_task_id,')
-    cb.dedent()
-    cb.emit("]")
-    cb.emit("for _tag in TAGS:")
-    cb.indent()
-    cb.emit('init_cmd += ["--tag", _tag]')
-    cb.dedent()
-    cb.emit("init_env: dict[str, str] = os.environ.copy()")
-    cb.emit("if parameters:")
-    cb.indent()
-    cb.emit('init_env["METAFLOW_PARAMETERS"] = json.dumps(parameters)')
-    cb.dedent()
-    cb.emit("subprocess.run(init_cmd, env=init_env, check=True)")
+def _input_paths_line(step: StepSpec, spec: FlowSpec) -> str:
+    """Return the ``input_paths: str = ...`` assignment for a task body."""
+    is_start = step.name == "start"
+    if is_start:
+        # _start_init_lines() will have already set param_task_id.
+        return 'input_paths: str = f"{run_id}/_parameters/{param_task_id}"'
+    if step.is_foreach_join:
+        return (
+            'input_paths: str = ",".join('
+            'f"{run_id}/{parent_step}/{tid}" for tid in task_ids)'
+        )
+    if step.is_split_join:
+        path_exprs = ", ".join(
+            'f"{{run_id}}/%s/{{parent_task_ids[%r]}}"' % (p, p)
+            for p in step.in_funcs
+        )
+        return 'input_paths: str = ",".join([%s])' % path_exprs
+    parent = step.in_funcs[0] if step.in_funcs else "start"
+    return 'input_paths: str = f"{run_id}/%s/{prev_task_id}"' % parent
+
+
+def _ctx_inject_lines() -> list[str]:
+    """Lines that inject the Prefect run context IDs into the subprocess env."""
+    return [
+        "try:",
+        _INDENT + "_ctx = get_run_context()",
+        _INDENT + '_extra_env["METAFLOW_PREFECT_FLOW_RUN_ID"] = str(_ctx.flow_run.id)',
+        _INDENT + '_extra_env["METAFLOW_PREFECT_TASK_RUN_ID"] = str(_ctx.task_run.id)',
+        "except Exception:",
+        _INDENT + "pass",
+    ]
+
+
+def _start_init_lines(spec: FlowSpec) -> list[str]:
+    """Lines that run the Metaflow ``init`` command to register flow parameters."""
+    return [
+        "# --- _parameters init task ---",
+        "param_task_id: str = uuid.uuid4().hex[:16]",
+        "init_cmd: list[str] = [",
+        _INDENT + "sys.executable, FLOW_FILE,",
+        _INDENT + '"--datastore", DATASTORE_TYPE,',
+        _INDENT + '"--metadata", METADATA_TYPE,',
+        _INDENT + '"--no-pylint",',
+        _INDENT + '"init",',
+        _INDENT + '"--run-id", run_id,',
+        _INDENT + '"--task-id", param_task_id,',
+        "]",
+        "for _tag in TAGS:",
+        _INDENT + 'init_cmd += ["--tag", _tag]',
+        "init_env: dict[str, str] = os.environ.copy()",
+        "if parameters:",
+        _INDENT + 'init_env["METAFLOW_PARAMETERS"] = json.dumps(parameters)',
+        "subprocess.run(init_cmd, env=init_env, check=True)",
+    ]
+
+
+def _artifact_lines(step: StepSpec) -> list[str]:
+    """Lines that publish a Prefect markdown artifact listing Metaflow artifacts."""
+    artifact_key = step.name.replace("_", "-")
+    return [
+        "_art_names = _mf_artifact_names(run_id, %r, task_id)" % step.name,
+        '_md = f"## `%s` — {run_id}\\n\\n"' % step.name,
+        "if _art_names:",
+        _INDENT + "for _n in _art_names:",
+        _INDENT * 2 + '_md += f"`{_n}`\\n"',
+        _INDENT * 2 + '_md += "```python\\n"',
+        _INDENT * 2 + "_md += f\"Task('{FLOW_NAME}/{run_id}/%s/{task_id}')['{_n}'].data\\n\"" % step.name,
+        _INDENT * 2 + '_md += "```\\n\\n"',
+        "else:",
+        _INDENT + '_md += "*(no user artifacts)*\\n"',
+        "create_markdown_artifact(key=%r, markdown=_md)" % artifact_key,
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Top-level @flow function
+# Section 4 — @flow function
 # ---------------------------------------------------------------------------
+
+
+def _build_flow(spec: FlowSpec, cfg: PrefectFlowConfig) -> str:
+    """Return the full source of the @flow function."""
+    flow_name = _python_name(spec.name)
+    decorator = _flow_decorator(spec, cfg)
+    sig = _flow_signature(spec.parameters)
+
+    body = _flow_body_lines(spec)
+    indented_body = [_INDENT + line if line else "" for line in body]
+
+    return "\n".join([
+        decorator,
+        "def %s(%s) -> None:" % (flow_name, sig),
+    ] + indented_body)
 
 
 def _flow_decorator(spec: FlowSpec, cfg: PrefectFlowConfig) -> str:
-    """Build the @flow(...) decorator string."""
-    parts = ["name=%r" % spec.name, "description=%r" % (spec.description or spec.name)]
+    parts = [
+        "name=%r" % spec.name,
+        "description=%r" % (spec.description or spec.name),
+        "task_runner=ThreadPoolTaskRunner(max_workers=%d)" % cfg.max_workers,
+    ]
     if cfg.workflow_timeout is not None:
         parts.append("timeout_seconds=%d" % cfg.workflow_timeout)
     return "@flow(%s)" % ", ".join(parts)
 
 
-def _emit_flow(cb: _CB, spec: FlowSpec, cfg: PrefectFlowConfig) -> None:
-    """Emit the top-level ``@flow`` function."""
-    # Schedule is registered at deploy time via the CLI; the @flow decorator
-    # itself carries only the name and description here.
-    cb.emit(_flow_decorator(spec, cfg))
-    sig = _flow_signature(spec.parameters)
-    cb.emit("def %s(%s) -> None:" % (_python_name(spec.name), sig))
-    cb.indent()
+def _flow_body_lines(spec: FlowSpec) -> list[str]:
+    """Return the unindented body lines for the @flow function."""
+    lines: list[str] = []
 
-    # derive run_id from Prefect's flow-run context
-    cb.emit("ctx = get_run_context()")
-    cb.emit("run_id: str = f\"prefect-{ctx.flow_run.id}\"")
+    # Derive the Metaflow run_id from Prefect's flow-run UUID.
+    lines.append("ctx = get_run_context()")
+    lines.append('run_id: str = f"prefect-{ctx.flow_run.id}"')
 
-    # collect parameters into a dict
+    # Collect Metaflow parameters into a dict for the init command.
     if spec.parameters:
         param_items = ", ".join('%r: %s' % (p.name, p.name) for p in spec.parameters)
-        cb.emit("parameters: dict[str, Any] = {%s}" % param_items)
+        lines.append("parameters: dict[str, Any] = {%s}" % param_items)
     else:
-        cb.emit("parameters: dict[str, Any] = {}")
+        lines.append("parameters: dict[str, Any] = {}")
 
-    cb.emit()
+    lines.append("")
+    lines += _flow_wiring_lines(spec)
+    return lines
 
-    # wire up task calls (topological order)
-    task_id_vars: dict[str, str] = {}   # step_name -> Python variable name
 
-    # Track foreach nodes so we can emit dynamic list comprehensions
-    foreach_nodes = {s.name for s in spec.steps if s.node_type == NodeType.FOREACH}
-    # Map foreach_step_name -> body_step_name
-    foreach_body: dict[str, str] = {}
-    for s in spec.steps:
-        if s.node_type == NodeType.FOREACH and s.out_funcs:
-            foreach_body[s.name] = s.out_funcs[0]
+def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
+    """Return lines that call each @task in topological order."""
+    lines: list[str] = []
+
+    # task_id_vars maps step_name → Python variable name holding its task_id.
+    task_id_vars: dict[str, str] = {}
+
+    # Map foreach step name → its immediate body step name.
+    foreach_body: dict[str, str] = {
+        s.name: s.out_funcs[0]
+        for s in spec.steps
+        if s.node_type == NodeType.FOREACH and s.out_funcs
+    }
 
     for step in spec.steps:
-        var = "_tid_%s" % step.name
+        tid_var = "_tid_%s" % step.name
         is_start = step.name == "start"
 
         if is_start and step.node_type == NodeType.FOREACH:
-            # start step that is also a foreach fan-out
-            cb.emit(
+            # start that fans out immediately: call it, then submit all body tasks.
+            lines.append(
                 "%s_pair: tuple[str, int] = %s(run_id, parameters)"
-                % (var, _task_fn(step.name))
+                % (tid_var, _task_fn(step.name))
             )
-            cb.emit("%s: str = %s_pair[0]" % (var, var))
-            cb.emit("%s_nsplits: int = %s_pair[1]" % (var, var))
-            body_name = foreach_body[step.name]
-            body_var = "_tid_%s_list" % body_name
-            futures_var = "_futures_%s" % body_name
-            cb.emit(
-                "%s = [%s.submit(run_id, %s, split_index=_i) for _i in range(%s_nsplits)]"
-                % (futures_var, _task_fn(body_name), var, var)
-            )
-            cb.emit("%s: list[str] = [_f.result() for _f in %s]" % (body_var, futures_var))
-            task_id_vars[body_name] = body_var
+            lines.append("%s: str = %s_pair[0]" % (tid_var, tid_var))
+            lines.append("%s_nsplits: int = %s_pair[1]" % (tid_var, tid_var))
+            lines += _submit_foreach_body(tid_var, foreach_body[step.name])
+            task_id_vars[step.name] = tid_var
 
         elif is_start:
-            # start step with linear or static-split next
-            cb.emit("%s: str = %s(run_id, parameters)" % (var, _task_fn(step.name)))
+            lines.append(
+                "%s: str = %s(run_id, parameters)" % (tid_var, _task_fn(step.name))
+            )
+            task_id_vars[step.name] = tid_var
 
         elif step.is_foreach_join:
-            # The body step immediately precedes this join
-            foreach_step = spec.steps[
-                next(i for i, s in enumerate(spec.steps) if s.name == step.split_parents[-1])
-            ]
-            body_name = foreach_body[foreach_step.name]
-            body_var = "_tid_%s_list" % body_name
-            cb.emit(
+            body_step_name = foreach_body[_foreach_parent(step, spec)]
+            body_var = "_tid_%s_list" % body_step_name
+            lines.append(
                 "%s: str = %s(run_id, %r, %s)"
-                % (var, _task_fn(step.name), body_name, body_var)
+                % (tid_var, _task_fn(step.name), body_step_name, body_var)
             )
+            task_id_vars[step.name] = tid_var
 
         elif step.is_split_join:
-            parent_ids_literal = "{%s}" % ", ".join(
+            parent_ids = "{%s}" % ", ".join(
                 "%r: %s" % (p, task_id_vars[p]) for p in step.in_funcs
             )
-            cb.emit("%s: str = %s(run_id, %s)" % (var, _task_fn(step.name), parent_ids_literal))
+            lines.append(
+                "%s: str = %s(run_id, %s)" % (tid_var, _task_fn(step.name), parent_ids)
+            )
+            task_id_vars[step.name] = tid_var
 
         elif step.node_type == NodeType.FOREACH:
-            # non-start foreach step always has a predecessor
-            parent = step.in_funcs[0]
-            cb.emit(
+            parent_var = task_id_vars[step.in_funcs[0]]
+            lines.append(
                 "%s_pair: tuple[str, int] = %s(run_id, %s)"
-                % (var, _task_fn(step.name), task_id_vars[parent])
+                % (tid_var, _task_fn(step.name), parent_var)
             )
-            cb.emit("%s: str = %s_pair[0]" % (var, var))
-            cb.emit("%s_nsplits: int = %s_pair[1]" % (var, var))
-
-            # Immediately emit the concurrent body-step submissions
-            body_name = foreach_body[step.name]
-            body_var = "_tid_%s_list" % body_name
-            futures_var = "_futures_%s" % body_name
-            cb.emit(
-                "%s = [%s.submit(run_id, %s, split_index=_i) for _i in range(%s_nsplits)]"
-                % (futures_var, _task_fn(body_name), var, var)
-            )
-            cb.emit("%s: list[str] = [_f.result() for _f in %s]" % (body_var, futures_var))
-            # register body var so the foreach join can find it
-            task_id_vars[body_name] = body_var
+            lines.append("%s: str = %s_pair[0]" % (tid_var, tid_var))
+            lines.append("%s_nsplits: int = %s_pair[1]" % (tid_var, tid_var))
+            lines += _submit_foreach_body(tid_var, foreach_body[step.name])
+            task_id_vars[step.name] = tid_var
 
         elif step.name in foreach_body.values():
-            # This is a foreach body step — already emitted in the foreach block above.
+            # Already emitted inside the foreach block above; just register the var.
             task_id_vars[step.name] = "_tid_%s_list" % step.name
-            continue
 
         else:
-            # linear, split, end
-            parent = step.in_funcs[0]
-            cb.emit("%s: str = %s(run_id, %s)" % (var, _task_fn(step.name), task_id_vars[parent]))
+            # Linear, split branch, or end step.
+            parent_var = task_id_vars[step.in_funcs[0]]
+            lines.append(
+                "%s: str = %s(run_id, %s)" % (tid_var, _task_fn(step.name), parent_var)
+            )
+            task_id_vars[step.name] = tid_var
 
-        task_id_vars[step.name] = var
+    return lines
 
-    cb.dedent()
+
+def _submit_foreach_body(foreach_tid_var: str, body_step_name: str) -> list[str]:
+    """Lines that .submit() foreach body tasks and collect their results."""
+    futures_var = "_futures_%s" % body_step_name
+    results_var = "_tid_%s_list" % body_step_name
+    return [
+        "%s = [%s.submit(run_id, %s, split_index=_i) for _i in range(%s_nsplits)]"
+        % (futures_var, _task_fn(body_step_name), foreach_tid_var, foreach_tid_var),
+        "%s: list[str] = [_f.result() for _f in %s]" % (results_var, futures_var),
+    ]
+
+
+def _foreach_parent(join_step: StepSpec, spec: FlowSpec) -> str:
+    """Return the name of the foreach step that this join closes."""
+    parent_name = join_step.split_parents[-1]
+    return next(s.name for s in spec.steps if s.name == parent_name)
 
 
 # ---------------------------------------------------------------------------
-# Small helpers
+# Small utilities shared by tasks and flow
 # ---------------------------------------------------------------------------
 
 
@@ -673,10 +620,9 @@ def _task_fn(step_name: str) -> str:
 
 
 def _python_name(flow_name: str) -> str:
-    """Convert CamelCase flow name to snake_case for Python identifiers."""
-    name = flow_name
+    """Convert CamelCase flow name to snake_case."""
     result = []
-    for i, ch in enumerate(name):
+    for i, ch in enumerate(flow_name):
         if ch.isupper() and i > 0:
             result.append("_")
         result.append(ch.lower())
@@ -684,18 +630,24 @@ def _python_name(flow_name: str) -> str:
 
 
 def _flow_signature(params: Sequence[ParameterSpec]) -> str:
-    """Build the Python function parameter string from flow parameters."""
-    parts: list[str] = []
-    for p in params:
+    """Build the function parameter string from flow parameters.
+
+    Required params (no default) are emitted before optional ones so the
+    generated signature is always valid Python.
+    """
+    def _param_str(p: ParameterSpec) -> str:
+        if p.required:
+            return '%s: %s' % (p.name, p.type_name)
         if isinstance(p.default, str):
-            parts.append('%s: str = %r' % (p.name, p.default))
-        elif isinstance(p.default, bool):
-            # bool before int — bool IS a subtype of int in Python
-            parts.append('%s: bool = %r' % (p.name, p.default))
-        elif isinstance(p.default, int):
-            parts.append('%s: int = %r' % (p.name, p.default))
-        elif isinstance(p.default, float):
-            parts.append('%s: float = %r' % (p.name, p.default))
-        else:
-            parts.append('%s: Any = %r' % (p.name, p.default))
-    return ", ".join(parts)
+            return '%s: str = %r' % (p.name, p.default)
+        if isinstance(p.default, bool):
+            return '%s: bool = %r' % (p.name, p.default)  # bool before int
+        if isinstance(p.default, int):
+            return '%s: int = %r' % (p.name, p.default)
+        if isinstance(p.default, float):
+            return '%s: float = %r' % (p.name, p.default)
+        return '%s: Any = %r' % (p.name, p.default)
+
+    required = [_param_str(p) for p in params if p.required]
+    optional = [_param_str(p) for p in params if not p.required]
+    return ", ".join(required + optional)
