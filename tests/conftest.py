@@ -127,6 +127,18 @@ def required_param_flow_graph() -> tuple[Any, Any]:
     return _load_flow_graph(str(FLOWS_DIR / "required_param_flow.py"))
 
 
+@pytest.fixture(scope="session")
+def nested_foreach_flow_graph() -> tuple[Any, Any]:
+    """(graph, flow) for NestedForeachFlow (2-level foreach nesting)."""
+    return _load_flow_graph(str(FLOWS_DIR / "nested_foreach_flow.py"))
+
+
+@pytest.fixture(scope="session")
+def triple_foreach_flow_graph() -> tuple[Any, Any]:
+    """(graph, flow) for TripleForeachFlow (3-level foreach nesting)."""
+    return _load_flow_graph(str(FLOWS_DIR / "triple_foreach_flow.py"))
+
+
 # ---------------------------------------------------------------------------
 # Mock Metaflow infrastructure objects
 # ---------------------------------------------------------------------------

@@ -545,3 +545,178 @@ class TestForeachConcurrency:
         # Direct call pattern: _step_foreach_step(run_id, ...split_index
         direct = re.search(r"_step_foreach_step\(run_id,.*split_index", src)
         assert direct is None, "foreach body called directly instead of via .submit()"
+
+
+class TestNestedForeachCodegen:
+    """Generated code for 2-level nested foreach flows."""
+
+    @pytest.fixture
+    def src(self, nested_foreach_flow_graph: tuple[Any, Any]) -> str:
+        graph, flow = nested_foreach_flow_graph
+        spec = analyze_graph(graph, flow)
+        return generate_prefect_file(spec, _make_cfg())
+
+    def test_is_valid_python(self, src: str) -> None:
+        _parse(src)
+
+    def test_all_task_functions_present(self, src: str) -> None:
+        tree = _parse(src)
+        fns = _fn_names_at_module_level(tree)
+        for name in (
+            "_step_start", "_step_outer_step", "_step_inner_step",
+            "_step_inner_join", "_step_outer_join", "_step_end",
+        ):
+            assert name in fns, "%s missing from generated file" % name
+
+    def test_outer_step_returns_tuple(self, src: str) -> None:
+        """outer_step is a foreach — must return (task_id, num_splits)."""
+        tree = _parse(src)
+        fn = _find_fn(tree, "_step_outer_step")
+        assert fn is not None
+        if fn.returns:
+            annotation_src = ast.unparse(fn.returns)
+            assert "tuple" in annotation_src.lower()
+
+    def test_inner_foreach_submitted_in_comprehension(self, src: str) -> None:
+        """outer_step (inner foreach) should be .submit()'d for each outer split."""
+        assert "_step_outer_step.submit(" in src
+
+    def test_inner_body_submitted_in_loop(self, src: str) -> None:
+        """inner_step should be .submit()'d inside a for loop over outer splits."""
+        assert "_step_inner_step.submit(" in src
+
+    def test_inner_join_called_per_outer_split(self, src: str) -> None:
+        """inner_join is called inside the per-outer-split loop."""
+        assert "_step_inner_join(" in src
+        # The call site (not the def) must be indented (inside the for loop).
+        call_lines = [
+            line for line in src.splitlines()
+            if "_step_inner_join(" in line and not line.lstrip().startswith("def ")
+        ]
+        assert call_lines, "No call to _step_inner_join found"
+        assert call_lines[0].startswith("    "), (
+            "inner_join call should be indented (inside for loop)"
+        )
+
+    def test_outer_join_called_with_inner_join_list(self, src: str) -> None:
+        """outer_join receives the accumulated list of inner_join task IDs."""
+        assert "_step_outer_join(" in src
+        # Variable holds the list of inner_join task IDs accumulated across outer splits.
+        assert "_tid_outer_join_list" in src
+
+    def test_for_loop_over_outer_pairs(self, src: str) -> None:
+        """Generated code contains a for loop iterating over outer foreach results."""
+        assert "for _outer_step_tid, _outer_step_nsplits in _pairs_outer_step:" in src
+
+
+class TestResourceTags:
+    """@resources values are emitted as tags= on @task."""
+
+    @pytest.fixture
+    def src(self, resources_flow_graph: tuple[Any, Any]) -> str:
+        graph, flow = resources_flow_graph
+        spec = analyze_graph(graph, flow)
+        return generate_prefect_file(spec, _make_cfg())
+
+    def test_is_valid_python(self, src: str) -> None:
+        _parse(src)
+
+    def test_cpu_tag_in_task_decorator(self, src: str) -> None:
+        """resource:cpu tag present on step with @resources(cpu=4)."""
+        assert "resource:cpu=4" in src
+
+    def test_memory_tag_in_task_decorator(self, src: str) -> None:
+        """resource:memory tag present on step with @resources(memory=8192)."""
+        assert "resource:memory=8192" in src
+
+    def test_gpu_tag_in_task_decorator(self, src: str) -> None:
+        """resource:gpu tag present on step with @resources(gpu=1)."""
+        assert "resource:gpu=1" in src
+
+    def test_tags_kwarg_in_task_decorator(self, src: str) -> None:
+        """tags= kwarg appears in @task() for steps with resources."""
+        assert "tags=" in src
+
+    def test_gpu_concurrency_tag(self, src: str) -> None:
+        """task_run_concurrency_tags added for GPU steps."""
+        assert 'task_run_concurrency_tags=["gpu"]' in src
+
+    def test_no_concurrency_tag_without_gpu(self, src: str) -> None:
+        """Steps without GPU must NOT get task_run_concurrency_tags."""
+        # start has cpu+memory but no gpu — find its @task decorator line
+        tree = _parse(src)
+        fn = _find_fn(tree, "_step_start")
+        assert fn is not None
+        # Reconstruct the decorator source
+        start_src = ast.unparse(fn)
+        assert "task_run_concurrency_tags" not in start_src
+
+
+class TestTripleForeachCodegen:
+    """Generated code for 3-level nested foreach flows (arbitrary depth)."""
+
+    @pytest.fixture
+    def src(self, triple_foreach_flow_graph: tuple[Any, Any]) -> str:
+        graph, flow = triple_foreach_flow_graph
+        spec = analyze_graph(graph, flow)
+        return generate_prefect_file(spec, _make_cfg())
+
+    def test_is_valid_python(self, src: str) -> None:
+        _parse(src)
+
+    def test_all_task_functions_present(self, src: str) -> None:
+        tree = _parse(src)
+        fns = _fn_names_at_module_level(tree)
+        for name in (
+            "_step_start", "_step_outer_step", "_step_middle_step",
+            "_step_inner_step", "_step_inner_join", "_step_middle_join",
+            "_step_outer_join", "_step_end",
+        ):
+            assert name in fns, "%s missing from generated file" % name
+
+    def test_three_foreach_steps_return_tuple(self, src: str) -> None:
+        """start, outer_step, middle_step are all foreach — must return tuple."""
+        tree = _parse(src)
+        for fn_name in ("_step_start", "_step_outer_step", "_step_middle_step"):
+            fn = _find_fn(tree, fn_name)
+            assert fn is not None
+            if fn.returns:
+                assert "tuple" in ast.unparse(fn.returns).lower(), (
+                    "%s should return tuple" % fn_name
+                )
+
+    def test_middle_step_submitted_in_comprehension(self, src: str) -> None:
+        """middle_step (2nd level foreach) is .submit()'d inside the outer loop."""
+        assert "_step_middle_step.submit(" in src
+
+    def test_inner_step_submitted(self, src: str) -> None:
+        """inner_step (3rd level body) is .submit()'d."""
+        assert "_step_inner_step.submit(" in src
+
+    def test_two_for_loops_generated(self, src: str) -> None:
+        """Three levels of nesting require two nested for loops in the flow body."""
+        flow_body_lines = [
+            line for line in src.splitlines()
+            if line.lstrip().startswith("for ") and "_tid" in line
+        ]
+        assert len(flow_body_lines) >= 2, (
+            "Expected at least 2 for loops for 3-level nested foreach, "
+            "got %d: %s" % (len(flow_body_lines), flow_body_lines)
+        )
+
+    def test_all_joins_called(self, src: str) -> None:
+        """All three join steps are invoked in the generated code."""
+        for fn in ("_step_inner_join(", "_step_middle_join(", "_step_outer_join("):
+            assert fn in src, "%s not found in generated source" % fn
+
+    def test_inner_join_innermost_indented(self, src: str) -> None:
+        """inner_join call is the most-deeply indented join (inside 2 for loops)."""
+        call_lines = [
+            line for line in src.splitlines()
+            if "_step_inner_join(" in line and not line.lstrip().startswith("def ")
+        ]
+        assert call_lines, "No call to _step_inner_join found"
+        # Must be indented at least 8 spaces (inside 2 loops at 4-space indent each)
+        assert len(call_lines[0]) - len(call_lines[0].lstrip()) >= 8, (
+            "inner_join call should be doubly-indented, got: %r" % call_lines[0]
+        )

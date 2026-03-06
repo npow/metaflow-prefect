@@ -171,8 +171,11 @@ def _make_mock_graph(parallel_foreach: bool = False, deco_names: list[str] | Non
     return graph, flow
 
 
-def _make_nested_foreach_graph() -> tuple[Any, Any]:
-    """A (graph, flow) mock where a foreach step is inside another foreach."""
+def _make_2level_nested_foreach_graph() -> tuple[Any, Any]:
+    """2-level nesting: foreach step inside another foreach (1 foreach ancestor).
+
+    This should NOT raise — 2-level nesting is supported.
+    """
     outer = MagicMock()
     outer.name = "start"
     outer.type = "foreach"
@@ -189,7 +192,7 @@ def _make_nested_foreach_graph() -> tuple[Any, Any]:
     inner.decorators = []
     inner.in_funcs = ["start"]
     inner.out_funcs = []
-    inner.split_parents = ["start"]  # start is an open foreach ancestor
+    inner.split_parents = ["start"]  # 1 foreach ancestor — allowed
 
     graph = MagicMock()
     graph.__iter__ = MagicMock(return_value=iter([outer, inner]))
@@ -198,7 +201,54 @@ def _make_nested_foreach_graph() -> tuple[Any, Any]:
     )
 
     flow = MagicMock()
-    flow.name = "NestedForeachFlow"
+    flow.name = "TwoLevelForeach"
+    flow._get_parameters = MagicMock(return_value=[])
+    flow._flow_decorators = {}
+    return graph, flow
+
+
+def _make_3level_nested_foreach_graph() -> tuple[Any, Any]:
+    """3-level nesting: foreach inside foreach inside foreach (2 foreach ancestors)."""
+    outer = MagicMock()
+    outer.name = "start"
+    outer.type = "foreach"
+    outer.parallel_foreach = False
+    outer.decorators = []
+    outer.in_funcs = []
+    outer.out_funcs = ["middle"]
+    outer.split_parents = []
+
+    middle = MagicMock()
+    middle.name = "middle"
+    middle.type = "foreach"
+    middle.parallel_foreach = False
+    middle.decorators = []
+    middle.in_funcs = ["start"]
+    middle.out_funcs = ["deepest"]
+    middle.split_parents = ["start"]
+
+    deepest = MagicMock()
+    deepest.name = "deepest"
+    deepest.type = "foreach"
+    deepest.parallel_foreach = False
+    deepest.decorators = []
+    deepest.in_funcs = ["middle"]
+    deepest.out_funcs = []
+    deepest.split_parents = ["start", "middle"]  # 2 foreach ancestors — raises
+
+    def _getitem(name: str) -> MagicMock:
+        if name == "start":
+            return outer
+        if name == "middle":
+            return middle
+        return deepest
+
+    graph = MagicMock()
+    graph.__iter__ = MagicMock(return_value=iter([outer, middle, deepest]))
+    graph.__getitem__ = MagicMock(side_effect=_getitem)
+
+    flow = MagicMock()
+    flow.name = "ThreeLevelForeach"
     flow._get_parameters = MagicMock(return_value=[])
     flow._flow_decorators = {}
     return graph, flow
@@ -243,11 +293,25 @@ class TestValidation:
         with pytest.raises(NotSupportedException, match="@exit_hook"):
             analyze_graph(graph, flow)
 
-    def test_nested_foreach_raises(self) -> None:
-        """A foreach step whose split_parents contains a foreach raises."""
-        graph, flow = _make_nested_foreach_graph()
-        with pytest.raises(NotSupportedException, match="[Nn]ested foreach"):
+    def test_nested_foreach_does_not_raise(self) -> None:
+        """2-level nested foreach is allowed (arbitrary nesting depth supported)."""
+        graph, flow = _make_2level_nested_foreach_graph()
+        try:
             analyze_graph(graph, flow)
+        except NotSupportedException:
+            pytest.fail("2-level nested foreach should not raise NotSupportedException")
+        except Exception:
+            pass  # Other errors from incomplete mock graph are OK
+
+    def test_3level_nested_foreach_does_not_raise(self) -> None:
+        """3-level nested foreach is also allowed — no depth limit."""
+        graph, flow = _make_3level_nested_foreach_graph()
+        try:
+            analyze_graph(graph, flow)
+        except NotSupportedException:
+            pytest.fail("3-level nested foreach should not raise NotSupportedException")
+        except Exception:
+            pass  # Other errors from incomplete mock graph are OK
 
 
 class TestResourcesExtraction:

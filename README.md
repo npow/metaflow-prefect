@@ -212,10 +212,9 @@ Unsupported decorators (`@batch`, `@slurm`, `@trigger`, `@trigger_on_finish`, `@
 
 | Limitation | Detail |
 |---|---|
-| No `@condition` support | Metaflow's conditional branching (`@condition`) is not yet supported. Flows using it will produce incorrect generated code. |
-| No nested foreach | Nested `foreach` (a foreach step inside another foreach) is not yet implemented. The wiring logic currently only handles a single level of fan-out. Raises an error at compile time. |
+| No `@condition` support | Metaflow's conditional branching (`@condition`) is not supported — it raises a compile-time error to prevent generating incorrect code. |
 | No `parallel_foreach` | `parallel_foreach=True` (Metaflow's MPI-style multi-node execution) is a genuine architectural limitation — it requires `@batch` or `@kubernetes` backends and runs as a single distributed job, which has no Prefect equivalent. Raises an error at compile time. |
-| `@resources` is advisory only | CPU/GPU/memory hints from `@resources` are emitted as comments in the generated file. You must configure matching resources on the Prefect work pool manually. |
+| `@resources` adds Prefect tags | CPU/GPU/memory hints from `@resources` are added as `tags=["resource:cpu=N", ...]` on the generated `@task`. GPU steps also receive `task_run_concurrency_tags=["gpu"]` for rate-limiting. These tags are visible in the Prefect UI but do not automatically allocate resources — configure matching resources on the work pool. **Sandbox users**: use `@sandbox(cpu=N, gpu=G)` for actual resource allocation; `@resources` tags remain advisory. |
 
 ## Development
 

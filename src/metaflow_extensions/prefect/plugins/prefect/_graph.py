@@ -73,6 +73,8 @@ def analyze_graph(
 
 def _validate(graph: Any, flow: Any) -> None:
     """Raise NotSupportedException for features incompatible with Prefect."""
+    import warnings
+
     # Step-level checks
     for node in graph:
         if node.parallel_foreach:
@@ -89,18 +91,23 @@ def _validate(graph: Any, flow: Any) -> None:
                 raise NotSupportedException(
                     "Step *%s* uses @slurm which is not supported with Prefect." % node.name
                 )
-        # Nested foreach: a foreach whose split_parents contains another foreach.
-        if node.type == "foreach":
-            for ancestor_name in node.split_parents:
-                try:
-                    ancestor = graph[ancestor_name]
-                except Exception:
-                    continue
-                if ancestor.type == "foreach":
-                    raise NotSupportedException(
-                        "Nested foreach is not supported with Prefect deployments "
-                        "(step *%s* is a foreach inside another foreach)." % node.name
-                    )
+        # Nested foreach is supported at arbitrary depth — no limit here.
+        for deco in node.decorators:
+            if deco.name == "condition":
+                raise NotSupportedException(
+                    "Step *%s* uses @condition which is not supported with Prefect. "
+                    "Conditional branching via @condition produces incorrect generated "
+                    "code and must be removed." % node.name
+                )
+            if deco.name == "resources":
+                warnings.warn(
+                    "Step *%s* uses @resources. Resource requirements are recorded as "
+                    "Prefect task tags (resource:cpu=N, resource:gpu=N, etc.) but are "
+                    "NOT enforced — configure matching resources on your Prefect work pool "
+                    "to actually constrain execution." % node.name,
+                    UserWarning,
+                    stacklevel=2,
+                )
 
     # Flow-level decorator checks
     for bad_deco in ("trigger", "trigger_on_finish", "exit_hook"):

@@ -301,6 +301,17 @@ def _task_decorator(step: StepSpec) -> str:
         parts.append("timeout_seconds=%d" % step.timeout_seconds)
     if step.retry_delay_seconds is not None:
         parts.append("retry_delay_seconds=%d" % step.retry_delay_seconds)
+    resource_tags = []
+    if step.resource_cpu is not None:
+        resource_tags.append("resource:cpu=%d" % step.resource_cpu)
+    if step.resource_memory is not None:
+        resource_tags.append("resource:memory=%d" % step.resource_memory)
+    if step.resource_gpu is not None:
+        resource_tags.append("resource:gpu=%d" % step.resource_gpu)
+    if resource_tags:
+        parts.append("tags=%r" % resource_tags)
+        if step.resource_gpu is not None:
+            parts.append('task_run_concurrency_tags=["gpu"]')
     return "@task(%s)" % ", ".join(parts)
 
 
@@ -521,26 +532,38 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
     # task_id_vars maps step_name → Python variable name holding its task_id.
     task_id_vars: dict[str, str] = {}
 
-    # Map foreach step name → its immediate body step name.
-    foreach_body: dict[str, str] = {
-        s.name: s.out_funcs[0]
-        for s in spec.steps
-        if s.node_type == NodeType.FOREACH and s.out_funcs
-    }
+    # Build chains for all outermost foreach steps (supports arbitrary nesting depth).
+    chains = _foreach_chains(spec)
+
+    # Steps whose code is generated inside chain blocks — skip in main iteration.
+    nested_skip: set[str] = set()
+    for outer, chain in chains.items():
+        for _foreach_name, body_name, join_name in chain:
+            nested_skip.add(body_name)
+            nested_skip.add(join_name)
+        nested_skip.discard(outer)         # outermost foreach called at top level
+        nested_skip.discard(chain[0][2])   # outermost join handled by is_foreach_join
 
     for step in spec.steps:
         tid_var = "_tid_%s" % step.name
         is_start = step.name == "start"
 
-        if is_start and step.node_type == NodeType.FOREACH:
-            # start that fans out immediately: call it, then submit all body tasks.
+        if step.name in nested_skip:
+            # Handled inside a chain block; task_id_vars already populated.
+            pass
+
+        elif is_start and step.node_type == NodeType.FOREACH:
             lines.append(
                 "%s_pair: tuple[str, int] = %s(run_id, parameters)"
                 % (tid_var, _task_fn(step.name))
             )
             lines.append("%s: str = %s_pair[0]" % (tid_var, tid_var))
             lines.append("%s_nsplits: int = %s_pair[1]" % (tid_var, tid_var))
-            lines += _submit_foreach_body(tid_var, foreach_body[step.name])
+            chain_lines, result_var, result_step = _chain_wiring_lines(
+                chains[step.name], tid_var, tid_var + "_nsplits"
+            )
+            lines += chain_lines
+            task_id_vars[result_step] = result_var
             task_id_vars[step.name] = tid_var
 
         elif is_start:
@@ -550,11 +573,12 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
             task_id_vars[step.name] = tid_var
 
         elif step.is_foreach_join:
-            body_step_name = foreach_body[_foreach_parent(step, spec)]
-            body_var = "_tid_%s_list" % body_step_name
+            # in_funcs[0] is the direct predecessor at every nesting depth.
+            parent_step_name = step.in_funcs[0]
+            body_var = task_id_vars[parent_step_name]
             lines.append(
                 "%s: str = %s(run_id, %r, %s)"
-                % (tid_var, _task_fn(step.name), body_step_name, body_var)
+                % (tid_var, _task_fn(step.name), parent_step_name, body_var)
             )
             task_id_vars[step.name] = tid_var
 
@@ -575,12 +599,12 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
             )
             lines.append("%s: str = %s_pair[0]" % (tid_var, tid_var))
             lines.append("%s_nsplits: int = %s_pair[1]" % (tid_var, tid_var))
-            lines += _submit_foreach_body(tid_var, foreach_body[step.name])
+            chain_lines, result_var, result_step = _chain_wiring_lines(
+                chains[step.name], tid_var, tid_var + "_nsplits"
+            )
+            lines += chain_lines
+            task_id_vars[result_step] = result_var
             task_id_vars[step.name] = tid_var
-
-        elif step.name in foreach_body.values():
-            # Already emitted inside the foreach block above; just register the var.
-            task_id_vars[step.name] = "_tid_%s_list" % step.name
 
         else:
             # Linear, split branch, or end step.
@@ -593,21 +617,133 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
     return lines
 
 
-def _submit_foreach_body(foreach_tid_var: str, body_step_name: str) -> list[str]:
-    """Lines that .submit() foreach body tasks and collect their results."""
-    futures_var = "_futures_%s" % body_step_name
-    results_var = "_tid_%s_list" % body_step_name
-    return [
-        "%s = [%s.submit(run_id, %s, split_index=_i) for _i in range(%s_nsplits)]"
-        % (futures_var, _task_fn(body_step_name), foreach_tid_var, foreach_tid_var),
-        "%s: list[str] = [_f.result() for _f in %s]" % (results_var, futures_var),
+def _foreach_chains(
+    spec: FlowSpec,
+) -> dict[str, list[tuple[str, str, str]]]:
+    """Return {outermost_foreach: chain} for every outermost foreach in the flow.
+
+    Each chain is a list of ``(foreach_name, body_name, join_name)`` tuples ordered
+    outermost-first.  The chain ends when ``body_name`` is NOT itself a foreach step,
+    so ``len(chain) == 1`` for a simple (non-nested) foreach.
+    """
+    # foreach step name → immediate body step name
+    foreach_body: dict[str, str] = {
+        s.name: s.out_funcs[0]
+        for s in spec.steps
+        if s.node_type == NodeType.FOREACH and s.out_funcs
+    }
+    # Foreach steps that are themselves the body of another foreach (nested)
+    nested_foreach = {body for body in foreach_body.values() if body in foreach_body}
+    # Outermost = foreach steps not nested inside another foreach
+    outermost = [name for name in foreach_body if name not in nested_foreach]
+
+    chains: dict[str, list[tuple[str, str, str]]] = {}
+    for outer in outermost:
+        chain: list[tuple[str, str, str]] = []
+        current = outer
+        while True:
+            body = foreach_body[current]
+            # The join for `current` is the is_foreach_join step whose split_parents[-1] == current
+            join = next(
+                s.name
+                for s in spec.steps
+                if s.is_foreach_join and s.split_parents and s.split_parents[-1] == current
+            )
+            chain.append((current, body, join))
+            if body in foreach_body:
+                current = body
+            else:
+                break
+        chains[outer] = chain
+
+    return chains
+
+
+def _chain_wiring_lines(
+    chain: list[tuple[str, str, str]],
+    foreach_tid_var: str,
+    foreach_nsplits_var: str,
+    depth: int = 0,
+    indent: str = "",
+) -> tuple[list[str], str, str]:
+    """Generate wiring lines for a foreach chain at arbitrary nesting depth.
+
+    Parameters
+    ----------
+    chain : list of (foreach_name, body_name, join_name)
+        Chain from current level down to innermost.  ``chain[0]`` is the level
+        whose foreach task has already been called (task_id in ``foreach_tid_var``).
+    foreach_tid_var, foreach_nsplits_var :
+        Python variable names holding the task_id / nsplits of ``chain[0][0]``.
+    depth : int
+        Recursion depth — used to pick a unique loop-index variable.
+    indent : str
+        Indentation prefix for generated lines (grows by ``_INDENT`` per level).
+
+    Returns
+    -------
+    lines : list[str]
+        Lines to append to the flow body.
+    result_var : str
+        Name of the Python variable that holds the list of task IDs consumed by the
+        join step that closes ``chain[0]`` (i.e. ``chain[0][2]``).
+    result_step : str
+        The step name whose task IDs populate ``result_var`` — passed as
+        ``parent_step`` to the join function.
+    """
+    _IDX = ["_i", "_j", "_k", "_l", "_m", "_n", "_o", "_p"]
+    idx = _IDX[depth] if depth < len(_IDX) else "_idx_%d" % depth
+
+    _foreach_name, body_name, join_name = chain[0]
+
+    if len(chain) == 1:
+        # Innermost level: body_name is a regular (non-foreach) step.
+        futures_var = "_futures_%s" % body_name
+        result_var = "_tid_%s_list" % body_name
+        lines = [
+            indent + "%s = [%s.submit(run_id, %s, split_index=%s) for %s in range(%s)]"
+            % (futures_var, _task_fn(body_name), foreach_tid_var, idx, idx, foreach_nsplits_var),
+            indent + "%s: list[str] = [_f.result() for _f in %s]" % (result_var, futures_var),
+        ]
+        return lines, result_var, body_name
+
+    # Nested: body_name is itself a foreach step — recurse.
+    inner_chain = chain[1:]
+    inner_join_name = inner_chain[0][2]
+
+    body_futures_var = "_futures_%s" % body_name
+    body_pairs_var = "_pairs_%s" % body_name
+    body_tid_item = "_%s_tid" % body_name
+    body_nsplits_item = "_%s_nsplits" % body_name
+    outer_result_var = "_tid_%s_list" % join_name   # list of inner_join task IDs
+    inner_join_single_var = "_%s_tid" % inner_join_name
+
+    lines: list[str] = [
+        indent + "%s = [%s.submit(run_id, %s, split_index=%s) for %s in range(%s)]"
+        % (body_futures_var, _task_fn(body_name), foreach_tid_var, idx, idx, foreach_nsplits_var),
+        indent + "%s = [_f.result() for _f in %s]" % (body_pairs_var, body_futures_var),
+        indent + "%s: list[str] = []" % outer_result_var,
+        indent + "for %s, %s in %s:" % (body_tid_item, body_nsplits_item, body_pairs_var),
     ]
 
+    inner_lines, inner_result_var, inner_result_step = _chain_wiring_lines(
+        inner_chain,
+        body_tid_item,
+        body_nsplits_item,
+        depth + 1,
+        indent + _INDENT,
+    )
+    lines += inner_lines
 
-def _foreach_parent(join_step: StepSpec, spec: FlowSpec) -> str:
-    """Return the name of the foreach step that this join closes."""
-    parent_name = join_step.split_parents[-1]
-    return next(s.name for s in spec.steps if s.name == parent_name)
+    lines.append(
+        indent + _INDENT + "%s = %s(run_id, %r, %s)"
+        % (inner_join_single_var, _task_fn(inner_join_name), inner_result_step, inner_result_var)
+    )
+    lines.append(
+        indent + _INDENT + "%s.append(%s)" % (outer_result_var, inner_join_single_var)
+    )
+
+    return lines, outer_result_var, inner_join_name
 
 
 # ---------------------------------------------------------------------------

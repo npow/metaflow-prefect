@@ -193,6 +193,8 @@ def run(
               help="Inject a decorator on every step (repeatable).")
 @click.option("--workflow-timeout", default=None, type=int,
               help="Flow-level timeout in seconds.")
+@click.option("--deployer-attribute-file", default=None, hidden=True,
+              help="Write deployment info JSON here (used by Metaflow Deployer API).")
 @click.pass_obj
 def deploy(
     obj: object,
@@ -204,8 +206,10 @@ def deploy(
     paused: bool,
     with_decorators: tuple[str, ...],
     workflow_timeout: int | None,
+    deployer_attribute_file: str | None,
 ) -> None:
     import importlib.util
+    import json
     import tempfile
 
     with tempfile.NamedTemporaryFile(
@@ -236,8 +240,63 @@ def deploy(
                 obj=obj,
             )
         )
+
+        if deployer_attribute_file:
+            with open(deployer_attribute_file, "w") as f:
+                json.dump(
+                    {
+                        "name": name,
+                        "flow_name": obj.flow.name,  # type: ignore[attr-defined]
+                        "metadata": "{}",
+                    },
+                    f,
+                )
     finally:
         os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# prefect trigger
+# ---------------------------------------------------------------------------
+
+
+@prefect.command(help="Trigger a run for a previously deployed Prefect deployment.")
+@click.option("--name", required=True, help="Prefect deployment name.")
+@click.option(
+    "--deployer-attribute-file", default=None, hidden=True,
+    help="Write triggered-run info JSON here (used by Metaflow Deployer API).",
+)
+@click.option(
+    "--run-param",
+    "run_params",
+    multiple=True,
+    default=None,
+    help="Flow parameter as key=value (repeatable).",
+)
+@click.pass_obj
+def trigger(
+    obj: object,
+    name: str,
+    deployer_attribute_file: str | None,
+    run_params: tuple[str, ...],
+) -> None:
+    import json
+
+    params: dict[str, str] = {}
+    for kv in run_params:
+        k, _, v = kv.partition("=")
+        params[k.strip()] = v.strip()
+
+    flow_name = obj.flow.name  # type: ignore[attr-defined]
+    asyncio.run(
+        _trigger_deployment(
+            flow_name=flow_name,
+            deployment_name=name,
+            params=params,
+            deployer_attribute_file=deployer_attribute_file,
+            obj=obj,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +384,65 @@ async def _register_deployment(
         ),
         bold=True,
     )
+
+
+async def _trigger_deployment(
+    flow_name: str,
+    deployment_name: str,
+    params: dict[str, str],
+    deployer_attribute_file: str | None,
+    obj: object,
+) -> None:
+    """Trigger a Prefect deployment run and optionally write run info to a file."""
+    import json
+
+    try:
+        from prefect.client.orchestration import get_client
+        from prefect.client.schemas.filters import DeploymentFilter, DeploymentFilterName, FlowFilter, FlowFilterName
+    except ImportError:
+        raise PrefectException(
+            "prefect is required for triggering deployments. "
+            "Install it with: pip install metaflow-prefect"
+        ) from None
+
+    async with get_client() as client:
+        deployments = await client.read_deployments(
+            flow_filter=FlowFilter(name=FlowFilterName(any_=[flow_name])),
+            deployment_filter=DeploymentFilter(name=DeploymentFilterName(any_=[deployment_name])),
+        )
+        if not deployments:
+            raise PrefectException(
+                "No deployment named %r found for flow %r." % (deployment_name, flow_name)
+            )
+        deployment = deployments[0]
+        flow_run = await client.create_flow_run_from_deployment(
+            deployment.id,
+            parameters=params or None,
+        )
+
+    run_id = "prefect-%s" % flow_run.id
+    pathspec = "%s/%s" % (flow_name, run_id)
+
+    if deployer_attribute_file:
+        with open(deployer_attribute_file, "w") as f:
+            json.dump(
+                {
+                    "pathspec": pathspec,
+                    "name": deployment_name,
+                    "metadata": "{}",
+                },
+                f,
+            )
+
+    try:
+        obj.echo(  # type: ignore[attr-defined]
+            "Triggered Prefect flow run *{run_id}* (pathspec: *{pathspec}*).".format(
+                run_id=flow_run.id, pathspec=pathspec
+            ),
+            bold=True,
+        )
+    except Exception:
+        pass
 
 
 def _resolve_name(obj: object) -> str:
