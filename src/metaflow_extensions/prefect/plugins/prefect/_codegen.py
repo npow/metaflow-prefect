@@ -369,6 +369,9 @@ def _task_body_lines(step: StepSpec, spec: FlowSpec) -> list[str]:
 
     lines.append("task_id: str = uuid.uuid4().hex[:16]")
     lines.append("_extra_env: dict[str, str] = {}")
+    # Ensure local metadata writes to $HOME/.metaflow/ regardless of CWD
+    # (Prefect workers may run from a temp directory).
+    lines.append('_extra_env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = os.path.expanduser("~")')
     lines += _ctx_inject_lines()
 
     if step.env_vars:
@@ -450,6 +453,7 @@ def _start_init_lines(spec: FlowSpec) -> list[str]:
         "for _tag in TAGS:",
         _INDENT + 'init_cmd += ["--tag", _tag]',
         "init_env: dict[str, str] = os.environ.copy()",
+        'init_env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = os.path.expanduser("~")',
         "if parameters:",
         _INDENT + 'init_env["METAFLOW_PARAMETERS"] = json.dumps(parameters)',
         "subprocess.run(init_cmd, env=init_env, check=True)",

@@ -210,49 +210,49 @@ def create(
 ) -> None:
     import importlib.util
     import json
-    import tempfile
 
-    with tempfile.NamedTemporaryFile(
-        suffix=".py", delete=False, mode="w", dir=os.getcwd()
-    ) as tmp:
-        tmp_path = tmp.name
+    # Write to a permanent file named after the flow so the Prefect worker
+    # can reload it later.  The temp-file approach breaks because to_deployment()
+    # records the file path and the worker needs it at execution time.
+    flow_file_name = "%s_prefect.py" % obj.flow.name.lower()  # type: ignore[attr-defined]
+    # Write next to the original flow file so the path is stable and the
+    # Prefect worker can find it regardless of CWD (os.getcwd() may be a temp dir).
+    flow_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    flow_file_path = os.path.join(flow_dir, flow_file_name)
 
-    try:
-        _make_flow_and_write(obj, tmp_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
-        spec = importlib.util.spec_from_file_location("_mf_prefect_flow", tmp_path)
-        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-        sys.modules[spec.name] = mod  # Make module importable for Prefect deployment introspection.
-        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    _make_flow_and_write(obj, flow_file_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
+    spec = importlib.util.spec_from_file_location("_mf_prefect_flow", flow_file_path)
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    sys.modules[spec.name] = mod  # Make module importable for Prefect deployment introspection.
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
 
-        flow_fn_name = _python_name(obj.flow.name)  # type: ignore[attr-defined]
-        prefect_flow_fn = getattr(mod, flow_fn_name)
+    flow_fn_name = _python_name(obj.flow.name)  # type: ignore[attr-defined]
+    prefect_flow_fn = getattr(mod, flow_fn_name)
 
-        schedule_cron = _get_schedule_cron(obj.flow)  # type: ignore[attr-defined]
+    schedule_cron = _get_schedule_cron(obj.flow)  # type: ignore[attr-defined]
 
-        asyncio.run(
-            _register_deployment(
-                prefect_flow_fn,
-                name=name,
-                cron=schedule_cron,
-                work_pool=work_pool,
-                paused=paused,
-                tags=list(tags),
-                obj=obj,
-            )
+    asyncio.run(
+        _register_deployment(
+            prefect_flow_fn,
+            name=name,
+            cron=schedule_cron,
+            work_pool=work_pool,
+            paused=paused,
+            tags=list(tags),
+            obj=obj,
         )
+    )
 
-        if deployer_attribute_file:
-            with open(deployer_attribute_file, "w") as f:
-                json.dump(
-                    {
-                        "name": name,
-                        "flow_name": obj.flow.name,  # type: ignore[attr-defined]
-                        "metadata": "{}",
-                    },
-                    f,
-                )
-    finally:
-        os.unlink(tmp_path)
+    if deployer_attribute_file:
+        with open(deployer_attribute_file, "w") as f:
+            json.dump(
+                {
+                    "name": name,
+                    "flow_name": obj.flow.name,  # type: ignore[attr-defined]
+                    "metadata": "{}",
+                },
+                f,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +375,14 @@ async def _register_deployment(
     )
     if asyncio.iscoroutine(deployment):
         deployment = await deployment
+
+    # Make the entrypoint absolute so the worker can find the flow file
+    # regardless of its CWD (Prefect stores relative paths by default).
+    if hasattr(deployment, "entrypoint") and deployment.entrypoint:
+        parts = deployment.entrypoint.rsplit(":", 1)
+        if len(parts) == 2:
+            filepath, funcname = parts
+            deployment.entrypoint = "%s:%s" % (os.path.abspath(filepath), funcname)
 
     apply_result = deployment.apply()
     deployment_id = await apply_result if asyncio.iscoroutine(apply_result) else apply_result

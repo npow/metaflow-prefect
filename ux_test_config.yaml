@@ -6,6 +6,10 @@ scheduler:
   scheduler_type: prefect
   deploy_args:
     name: "__test_name__"
+    work_pool: "mf-local"
 
-# No Titus / compute-env needed for local Prefect runs
-compute_env: {}
+compute_env:
+  METAFLOW_DEFAULT_METADATA: local
+  METAFLOW_DEFAULT_DATASTORE: local
+  METAFLOW_DEFAULT_ENVIRONMENT: local
+  PREFECT_API_URL: "http://127.0.0.1:4200/api"
