@@ -2,9 +2,9 @@
 
 Commands
 --------
-create  Compile the flow to a Prefect flow Python file.
-run     Compile and immediately run the flow via Prefect (local execution).
-deploy  Register the flow as a named Prefect deployment on the active server.
+compile  Compile the flow to a Prefect flow Python file.
+run      Compile and immediately run the flow via Prefect (local execution).
+create   Register the flow as a named Prefect deployment on the active server.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def prefect(obj: object) -> None:  # type: ignore[override]
 
 
 # ---------------------------------------------------------------------------
-# prefect create
+# prefect compile
 # ---------------------------------------------------------------------------
 
 
@@ -81,7 +81,7 @@ def prefect(obj: object) -> None:  # type: ignore[override]
     help="Flow-level timeout in seconds.",
 )
 @click.pass_obj
-def create(
+def compile(
     obj: object,
     output_file: str,
     tags: tuple[str, ...],
@@ -101,7 +101,7 @@ def create(
     obj.echo(  # type: ignore[attr-defined]
         "Prefect flow file written to *{out}*.\n"
         "Run it with:  python {out}\n"
-        "Or deploy it: python {flow} prefect deploy --name my-deployment".format(
+        "Or deploy it: python {flow} prefect create --name my-deployment".format(
             out=output_file,
             flow=sys.argv[0],
         ),
@@ -164,7 +164,7 @@ def run(
 
 
 # ---------------------------------------------------------------------------
-# prefect deploy
+# prefect create
 # ---------------------------------------------------------------------------
 
 
@@ -196,7 +196,7 @@ def run(
 @click.option("--deployer-attribute-file", default=None, hidden=True,
               help="Write deployment info JSON here (used by Metaflow Deployer API).")
 @click.pass_obj
-def deploy(
+def create(
     obj: object,
     name: str,
     tags: tuple[str, ...],

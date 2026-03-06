@@ -1,0 +1,11 @@
+######################################
+# UX Test Config for metaflow-prefect
+######################################
+
+scheduler:
+  scheduler_type: prefect
+  deploy_args:
+    name: "__test_name__"
+
+# No Titus / compute-env needed for local Prefect runs
+compute_env: {}
