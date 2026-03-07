@@ -190,7 +190,7 @@ def resume(
 
 
 @prefect.command(help="Register this flow as a named Prefect deployment.")
-@click.option("--name", required=True, help="Prefect deployment name.")
+@click.option("--name", default=None, help="Prefect deployment name (default: flow class name).")
 @click.option(
     "--tag",
     "tags",
@@ -219,7 +219,7 @@ def resume(
 @click.pass_obj
 def create(
     obj: object,
-    name: str,
+    name: str | None,
     tags: tuple[str, ...],
     user_namespace: str | None,
     max_workers: int,
@@ -229,6 +229,8 @@ def create(
     workflow_timeout: int | None,
     deployer_attribute_file: str | None,
 ) -> None:
+    if name is None:
+        name = obj.flow.name.lower()  # type: ignore[attr-defined]
     # Write to a permanent file named after the flow so the Prefect worker
     # can reload it later.  The temp-file approach breaks because to_deployment()
     # records the file path and the worker needs it at execution time.
