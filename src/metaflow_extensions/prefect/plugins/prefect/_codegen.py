@@ -530,8 +530,10 @@ def _build_flow(spec: FlowSpec, cfg: PrefectFlowConfig) -> str:
 
 
 def _flow_decorator(spec: FlowSpec, cfg: PrefectFlowConfig) -> str:
+    # Honour @project(name=...) by prefixing the Prefect flow name.
+    prefect_flow_name = "%s.%s" % (spec.project_name, spec.name) if spec.project_name else spec.name
     parts = [
-        "name=%r" % spec.name,
+        "name=%r" % prefect_flow_name,
         "description=%r" % (spec.description or spec.name),
         "task_runner=ThreadPoolTaskRunner(max_workers=%d)" % cfg.max_workers,
     ]

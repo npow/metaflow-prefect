@@ -31,7 +31,6 @@ def _make_prefect_flow(
     mock_metadata.TYPE = metadata_type
 
     return PrefectFlow(
-        name=getattr(flow, "name", "TestFlow"),
         graph=graph,
         flow=flow,
         code_package_metadata="",

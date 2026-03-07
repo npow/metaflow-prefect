@@ -12,8 +12,11 @@ trigger  Trigger a run for a previously deployed Prefect deployment.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import json
 import os
 import sys
+import tempfile
 
 from metaflow._vendor import click
 from metaflow.exception import MetaflowException
@@ -23,10 +26,7 @@ from metaflow.util import get_username
 from metaflow_extensions.prefect.plugins.prefect._codegen import _python_name
 from metaflow_extensions.prefect.plugins.prefect._graph import analyze_graph
 from metaflow_extensions.prefect.plugins.prefect._types import FlowSpec
-from metaflow_extensions.prefect.plugins.prefect.exception import (
-    NotSupportedException,
-    PrefectException,
-)
+from metaflow_extensions.prefect.plugins.prefect.exception import PrefectException
 from metaflow_extensions.prefect.plugins.prefect.prefect_flow import PrefectFlow
 
 
@@ -146,26 +146,7 @@ def run(
     with_decorators: tuple[str, ...],
     workflow_timeout: int | None,
 ) -> None:
-    import importlib.util
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(
-        suffix=".py", delete=False, mode="w", dir=os.getcwd()
-    ) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        _make_flow_and_write(obj, tmp_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
-        spec = importlib.util.spec_from_file_location("_mf_prefect_flow", tmp_path)
-        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-        sys.modules[spec.name] = mod  # Make module importable for Prefect deployment introspection.
-        spec.loader.exec_module(mod)  # type: ignore[union-attr]
-
-        # Call the flow's main entry-point (the @flow decorated function).
-        flow_fn_name = _python_name(obj.flow.name)  # type: ignore[attr-defined]
-        getattr(mod, flow_fn_name)()
-    finally:
-        os.unlink(tmp_path)
+    _compile_and_run_locally(obj, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -197,29 +178,10 @@ def resume(
     with_decorators: tuple[str, ...],
     workflow_timeout: int | None,
 ) -> None:
-    import importlib.util
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(
-        suffix=".py", delete=False, mode="w", dir=os.getcwd()
-    ) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        _make_flow_and_write(
-            obj, tmp_path, tags, user_namespace, max_workers,
-            with_decorators, workflow_timeout,
-            origin_run_id=clone_run_id,
-        )
-        spec = importlib.util.spec_from_file_location("_mf_prefect_flow", tmp_path)
-        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-        sys.modules[spec.name] = mod
-        spec.loader.exec_module(mod)  # type: ignore[union-attr]
-
-        flow_fn_name = _python_name(obj.flow.name)  # type: ignore[attr-defined]
-        getattr(mod, flow_fn_name)()
-    finally:
-        os.unlink(tmp_path)
+    _compile_and_run_locally(
+        obj, tags, user_namespace, max_workers, with_decorators, workflow_timeout,
+        origin_run_id=clone_run_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +229,6 @@ def create(
     workflow_timeout: int | None,
     deployer_attribute_file: str | None,
 ) -> None:
-    import importlib.util
-    import json
-
     # Write to a permanent file named after the flow so the Prefect worker
     # can reload it later.  The temp-file approach breaks because to_deployment()
     # records the file path and the worker needs it at execution time.
@@ -282,13 +241,12 @@ def create(
     mf_spec = analyze_graph(obj.graph, obj.flow)  # type: ignore[attr-defined]
 
     _make_flow_and_write(obj, flow_file_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
-    spec = importlib.util.spec_from_file_location("_mf_prefect_flow", flow_file_path)
-    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    sys.modules[spec.name] = mod  # Make module importable for Prefect deployment introspection.
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
 
-    flow_fn_name = _python_name(obj.flow.name)  # type: ignore[attr-defined]
-    prefect_flow_fn = getattr(mod, flow_fn_name)
+    mod_spec = importlib.util.spec_from_file_location("_mf_prefect_flow", flow_file_path)
+    mod = importlib.util.module_from_spec(mod_spec)  # type: ignore[arg-type]
+    sys.modules[mod_spec.name] = mod  # Make module importable for Prefect deployment introspection.
+    mod_spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    prefect_flow_fn = getattr(mod, _python_name(obj.flow.name))  # type: ignore[attr-defined]
 
     asyncio.run(
         _register_deployment(
@@ -340,8 +298,6 @@ def trigger(
     deployer_attribute_file: str | None,
     run_params: tuple[str, ...],
 ) -> None:
-    import json
-
     params: dict[str, str] = {}
     for kv in run_params:
         k, _, v = kv.partition("=")
@@ -362,6 +318,38 @@ def trigger(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _compile_and_run_locally(
+    obj: object,
+    tags: tuple[str, ...],
+    user_namespace: str | None,
+    max_workers: int,
+    with_decorators: tuple[str, ...],
+    workflow_timeout: int | None,
+    origin_run_id: str | None = None,
+) -> None:
+    """Compile the flow to a temp file, execute it in-process, then delete it."""
+    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w", dir=os.getcwd()) as tmp:
+        tmp_path = tmp.name
+    try:
+        _make_flow_and_write(
+            obj, tmp_path, tags, user_namespace, max_workers,
+            with_decorators, workflow_timeout, origin_run_id=origin_run_id,
+        )
+        _exec_flow_file(tmp_path, obj.flow.name)  # type: ignore[attr-defined]
+    finally:
+        os.unlink(tmp_path)
+
+
+def _exec_flow_file(path: str, flow_name: str) -> None:
+    """Load a generated Prefect flow file and call its @flow entry point."""
+    spec = importlib.util.spec_from_file_location("_mf_prefect_flow", path)
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    # Register in sys.modules so Prefect's deployment introspection can find it.
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    getattr(mod, _python_name(flow_name))()
 
 
 def _make_flow_and_write(
@@ -385,22 +373,20 @@ def _make_flow_and_write(
     )[0]
 
     pf = PrefectFlow(
-        name=_resolve_name(obj),  # type: ignore[arg-type]
         graph=obj.graph,          # type: ignore[attr-defined]
         flow=obj.flow,            # type: ignore[attr-defined]
         code_package_metadata=package.package_metadata,
         code_package_sha=code_package_sha,
         code_package_url=code_package_url,
-        metadata=obj.metadata,                      # type: ignore[attr-defined]
-        flow_datastore=obj.flow_datastore,          # type: ignore[attr-defined]
-        environment=obj.environment,                # type: ignore[attr-defined]
-        event_logger=obj.event_logger,              # type: ignore[attr-defined]
-        monitor=obj.monitor,                        # type: ignore[attr-defined]
+        metadata=obj.metadata,                # type: ignore[attr-defined]
+        flow_datastore=obj.flow_datastore,    # type: ignore[attr-defined]
+        environment=obj.environment,          # type: ignore[attr-defined]
+        event_logger=obj.event_logger,        # type: ignore[attr-defined]
+        monitor=obj.monitor,                  # type: ignore[attr-defined]
         tags=list(tags),
         namespace=user_namespace,
         username=get_username(),
         max_workers=max_workers,
-        description=obj.flow.__doc__,               # type: ignore[attr-defined]
         flow_file=os.path.abspath(sys.argv[0]),
         with_decorators=list(with_decorators),
         workflow_timeout=workflow_timeout,
@@ -450,9 +436,10 @@ async def _register_deployment(
     apply_result = deployment.apply()
     deployment_id = await apply_result if asyncio.iscoroutine(apply_result) else apply_result
 
-    if flow_spec.triggers or flow_spec.trigger_on_finishes:
-        async with get_client() as client:
-            await _sync_automations(client, deployment_id, name, flow_spec, obj)
+    # Always sync automations so stale ones are cleaned up even when all
+    # @trigger/@trigger_on_finish decorators have been removed from the flow.
+    async with get_client() as client:
+        await _sync_automations(client, deployment_id, name, flow_spec, obj)
 
     obj.echo(  # type: ignore[attr-defined]
         "Deployment *{name}* registered with id *{id}*.".format(
@@ -558,8 +545,6 @@ async def _trigger_deployment(
     obj: object,
 ) -> None:
     """Trigger a Prefect deployment run and optionally write run info to a file."""
-    import json
-
     try:
         from prefect.client.orchestration import get_client
         from prefect.client.schemas.filters import DeploymentFilter, DeploymentFilterName, FlowFilter, FlowFilterName
@@ -608,27 +593,5 @@ async def _trigger_deployment(
     except Exception:
         pass
 
-
-def _resolve_name(obj: object) -> str:
-    import re
-
-    name = obj.flow.name  # type: ignore[attr-defined]
-
-    # @project support: prefix with project name when present
-    try:
-        project_decos = obj.flow._flow_decorators.get("project")  # type: ignore[attr-defined]
-        if project_decos:
-            project_name = project_decos[0].attributes.get("name", "")
-            if project_name:
-                name = "%s.%s" % (project_name, name)
-    except Exception:
-        pass
-
-    # Keep only alphanumerics, hyphens, underscores, dots
-    if re.search(r"[^a-zA-Z0-9_\-\.]", name):
-        raise MetaflowException(
-            "Flow name '%s' contains characters not allowed in a Prefect flow name." % name
-        )
-    return name
 
 

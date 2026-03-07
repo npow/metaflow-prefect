@@ -26,7 +26,7 @@ class PrefectFlow:
 
     Usage::
 
-        pf = PrefectFlow(name, graph, flow, ..., flow_file="myflow.py")
+        pf = PrefectFlow(graph, flow, ..., flow_file="myflow.py")
         source = pf.compile()
         with open("output.py", "w") as f:
             f.write(source)
@@ -34,7 +34,6 @@ class PrefectFlow:
 
     def __init__(
         self,
-        name: str,
         graph: Any,
         flow: Any,
         code_package_metadata: str,
@@ -49,7 +48,6 @@ class PrefectFlow:
         namespace: str | None = None,
         username: str | None = None,
         max_workers: int = 10,
-        description: str | None = None,
         flow_file: str | None = None,
         workflow_timeout: int | None = None,
         with_decorators: list[str] | None = None,
@@ -57,10 +55,8 @@ class PrefectFlow:
     ) -> None:
         self._graph = graph
         self._flow = flow
-        self._name = name
         self._tags = list(tags or [])
         self._namespace = namespace
-        self._max_workers = max_workers
         self._flow_file = flow_file or os.path.abspath(os.path.realpath(__file__))
         env_type = getattr(environment, "TYPE", "local")
         event_logger_type = getattr(event_logger, "TYPE", "nullSidecarLogger")
