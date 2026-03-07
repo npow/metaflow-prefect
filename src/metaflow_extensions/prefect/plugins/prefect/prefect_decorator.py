@@ -58,7 +58,7 @@ class PrefectInternalDecorator(StepDecorator):
                 field=k,
                 value=v,
                 type=k,
-                tags=["attempt_id:{0}".format(retry_count)],
+                tags=[f"attempt_id:{retry_count}"],
             )
             for k, v in meta.items()
         ]

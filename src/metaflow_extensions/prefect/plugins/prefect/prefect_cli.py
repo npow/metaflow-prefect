@@ -30,7 +30,6 @@ from metaflow_extensions.prefect.plugins.prefect._types import FlowSpec
 from metaflow_extensions.prefect.plugins.prefect.exception import PrefectException
 from metaflow_extensions.prefect.plugins.prefect.prefect_flow import PrefectFlow
 
-
 # ---------------------------------------------------------------------------
 # CLI group
 # ---------------------------------------------------------------------------
@@ -106,12 +105,9 @@ def compile(
     )
 
     obj.echo(  # type: ignore[attr-defined]
-        "Prefect flow file written to *{out}*.\n"
-        "Run it with:  python {out}\n"
-        "Or deploy it: python {flow} prefect create --name my-deployment".format(
-            out=output_file,
-            flow=sys.argv[0],
-        ),
+        f"Prefect flow file written to *{output_file}*.\n"
+        f"Run it with:  python {output_file}\n"
+        f"Or deploy it: python {sys.argv[0]} prefect create --name my-deployment",
         bold=True,
     )
 
@@ -236,7 +232,7 @@ def create(
     # Write to a permanent file named after the flow so the Prefect worker
     # can reload it later.  The temp-file approach breaks because to_deployment()
     # records the file path and the worker needs it at execution time.
-    flow_file_name = "%s_prefect.py" % obj.flow.name.lower()  # type: ignore[attr-defined]
+    flow_file_name = f"{obj.flow.name.lower()}_prefect.py"  # type: ignore[attr-defined]
     # Write next to the original flow file so the path is stable and the
     # Prefect worker can find it regardless of CWD (os.getcwd() may be a temp dir).
     flow_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
@@ -368,6 +364,7 @@ def _make_flow_and_write(
     workflow_timeout: int | None = None,
     origin_run_id: str | None = None,
 ) -> None:
+    """Compile the flow and write the generated Prefect Python file to *output_file*."""
     package = MetaflowPackage(
         obj.flow,                # type: ignore[attr-defined]
         obj.environment,         # type: ignore[attr-defined]
@@ -438,7 +435,7 @@ async def _register_deployment(
         parts = deployment.entrypoint.rsplit(":", 1)
         if len(parts) == 2:
             filepath, funcname = parts
-            deployment.entrypoint = "%s:%s" % (os.path.abspath(filepath), funcname)
+            deployment.entrypoint = f"{os.path.abspath(filepath)}:{funcname}"
 
     apply_result = deployment.apply()
     deployment_id = await apply_result if asyncio.iscoroutine(apply_result) else apply_result
@@ -449,9 +446,7 @@ async def _register_deployment(
         await _sync_automations(client, deployment_id, name, flow_spec, echo)
 
     echo(
-        "Deployment *{name}* registered with id *{id}*.".format(
-            name=name, id=deployment_id
-        ),
+        f"Deployment *{name}* registered with id *{deployment_id}*.",
         bold=True,
     )
 
@@ -476,7 +471,7 @@ async def _sync_automations(
     desired: list[tuple[str, AutomationCore]] = []
 
     for trigger in spec.triggers:
-        auto_name = "metaflow/%s: on event '%s'" % (deployment_name, trigger.event_name)
+        auto_name = f"metaflow/{deployment_name}: on event '{trigger.event_name}'"
         event_trigger = EventTrigger(
             expect={trigger.event_name},
             posture=Posture.Reactive,
@@ -491,7 +486,7 @@ async def _sync_automations(
         )))
 
     for tof in spec.trigger_on_finishes:
-        auto_name = "metaflow/%s: on finish of '%s'" % (deployment_name, tof.flow_name)
+        auto_name = f"metaflow/{deployment_name}: on finish of '{tof.flow_name}'"
         event_trigger = EventTrigger(
             match_related={
                 "prefect.resource.role": "flow",
@@ -515,27 +510,25 @@ async def _sync_automations(
         existing = await client.read_automations_by_name(auto_name)  # type: ignore[attr-defined]
         if existing:
             await client.update_automation(existing[0].id, automation)  # type: ignore[attr-defined]
-            echo("Automation *{name}* updated.".format(name=auto_name), bold=False)
+            echo(f"Automation *{auto_name}* updated.", bold=False)
         else:
             await client.create_automation(automation)  # type: ignore[attr-defined]
-            echo("Automation *{name}* created.".format(name=auto_name), bold=False)
+            echo(f"Automation *{auto_name}* created.", bold=False)
 
     # Clean up stale automations from previous deploys of this deployment
     # (e.g. @trigger was removed from the flow).
-    owned_prefix = "metaflow/%s:" % deployment_name
+    owned_prefix = f"metaflow/{deployment_name}:"
     try:
         all_automations = await client.read_automations()  # type: ignore[attr-defined]
         for auto in all_automations:
             if auto.name.startswith(owned_prefix) and auto.name not in desired_names:
                 await client.delete_automation(auto.id)  # type: ignore[attr-defined]
                 echo(
-                    "Automation *{name}* deleted (no longer referenced by flow).".format(
-                        name=auto.name
-                    ),
+                    f"Automation *{auto.name}* deleted (no longer referenced by flow).",
                     bold=False,
                 )
     except Exception as exc:
-        echo("Warning: could not check for stale automations: %s" % exc, bold=False)
+        echo(f"Warning: could not check for stale automations: {exc}", bold=False)
 
 
 async def _trigger_deployment(
@@ -567,7 +560,7 @@ async def _trigger_deployment(
         )
         if not deployments:
             raise PrefectException(
-                "No deployment named %r found for flow %r." % (deployment_name, flow_name)
+                f"No deployment named {deployment_name!r} found for flow {flow_name!r}."
             )
         deployment = deployments[0]
         flow_run = await client.create_flow_run_from_deployment(
@@ -575,8 +568,8 @@ async def _trigger_deployment(
             parameters=params or None,
         )
 
-    run_id = "prefect-%s" % flow_run.id
-    pathspec = "%s/%s" % (flow_name, run_id)
+    run_id = f"prefect-{flow_run.id}"
+    pathspec = f"{flow_name}/{run_id}"
 
     if deployer_attribute_file:
         with open(deployer_attribute_file, "w") as f:
@@ -590,9 +583,6 @@ async def _trigger_deployment(
             )
 
     echo(
-        "Triggered Prefect flow run *{run_id}* (pathspec: *{pathspec}*).".format(
-            run_id=flow_run.id, pathspec=pathspec
-        ),
+        f"Triggered Prefect flow run *{flow_run.id}* (pathspec: *{pathspec}*).",
         bold=True,
     )
-

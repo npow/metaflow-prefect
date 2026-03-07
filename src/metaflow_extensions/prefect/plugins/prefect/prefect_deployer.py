@@ -6,7 +6,7 @@ is available and the UX test suite can parametrise ``--scheduler-type=prefect``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Dict, Optional, Type
+from typing import TYPE_CHECKING, ClassVar
 
 from metaflow.runner.deployer_impl import DeployerImpl
 
@@ -29,23 +29,23 @@ class PrefectDeployer(DeployerImpl):
         Maximum parallel Prefect tasks (default 10).
     """
 
-    TYPE: ClassVar[Optional[str]] = "prefect"
+    TYPE: ClassVar[str | None] = "prefect"
 
-    def __init__(self, deployer_kwargs: Dict[str, str], **kwargs) -> None:
+    def __init__(self, deployer_kwargs: dict[str, str], **kwargs) -> None:
         self._deployer_kwargs = deployer_kwargs
         super().__init__(**kwargs)
 
     @property
-    def deployer_kwargs(self) -> Dict[str, str]:
+    def deployer_kwargs(self) -> dict[str, str]:
         return self._deployer_kwargs
 
     @staticmethod
-    def deployed_flow_type() -> Type["PrefectDeployedFlow"]:
+    def deployed_flow_type() -> type[PrefectDeployedFlow]:
         from .prefect_deployer_objects import PrefectDeployedFlow
 
         return PrefectDeployedFlow
 
-    def create(self, **kwargs) -> "PrefectDeployedFlow":
+    def create(self, **kwargs) -> PrefectDeployedFlow:
         """Deploy this flow as a named Prefect deployment.
 
         Parameters

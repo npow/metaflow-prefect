@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import sys
-import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -77,7 +76,7 @@ def _load_flow_graph(flow_file: str) -> tuple[Any, Any]:
 
             return graph, _FlowProxy()
 
-    raise ValueError("No FlowSpec subclass found in %s" % flow_file)
+    raise ValueError(f"No FlowSpec subclass found in {flow_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +136,12 @@ def nested_foreach_flow_graph() -> tuple[Any, Any]:
 def triple_foreach_flow_graph() -> tuple[Any, Any]:
     """(graph, flow) for TripleForeachFlow (3-level foreach nesting)."""
     return _load_flow_graph(str(FLOWS_DIR / "triple_foreach_flow.py"))
+
+
+@pytest.fixture(scope="session")
+def mid_foreach_flow_graph() -> tuple[Any, Any]:
+    """(graph, flow) for MidForeachFlow (foreach at a non-start step)."""
+    return _load_flow_graph(str(FLOWS_DIR / "mid_foreach_flow.py"))
 
 
 # ---------------------------------------------------------------------------

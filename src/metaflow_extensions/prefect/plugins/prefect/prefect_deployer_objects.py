@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar
 
 from metaflow.runner.deployer import DeployedFlow, TriggeredRun
 from metaflow.runner.utils import get_lower_level_group, handle_timeout, temporary_fifo
 
 if TYPE_CHECKING:
-    import metaflow
-    import metaflow.runner.deployer_impl
+    pass
 
 
 class PrefectTriggeredRun(TriggeredRun):
@@ -21,14 +20,14 @@ class PrefectTriggeredRun(TriggeredRun):
     """
 
     @property
-    def prefect_ui(self) -> Optional[str]:
+    def prefect_ui(self) -> str | None:
         """URL to the Prefect UI for this flow run, if available."""
         # The pathspec is "FlowName/prefect-<uuid>"; extract the Prefect run UUID.
         try:
             _, run_id = self.pathspec.split("/")
             if run_id.startswith("prefect-"):
                 prefect_run_id = run_id[len("prefect-"):]
-                return "http://localhost:4200/flow-runs/flow-run/%s" % prefect_run_id
+                return f"http://localhost:4200/flow-runs/flow-run/{prefect_run_id}"
         except Exception:
             pass
         return None
@@ -37,6 +36,7 @@ class PrefectTriggeredRun(TriggeredRun):
     def run(self):
         """Retrieve the Run object, applying deployer env vars so local metadata works."""
         import os
+
         import metaflow
         from metaflow.exception import MetaflowNotFound
 
@@ -70,7 +70,7 @@ class PrefectTriggeredRun(TriggeredRun):
                 os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old_sysroot
 
     @property
-    def status(self) -> Optional[str]:
+    def status(self) -> str | None:
         """Return a simple status string based on the underlying Metaflow run."""
         run = self.run
         if run is None:
@@ -85,7 +85,7 @@ class PrefectTriggeredRun(TriggeredRun):
 class PrefectDeployedFlow(DeployedFlow):
     """A Metaflow flow deployed as a named Prefect deployment."""
 
-    TYPE: ClassVar[Optional[str]] = "prefect"
+    TYPE: ClassVar[str | None] = "prefect"
 
     @property
     def id(self) -> str:
@@ -98,9 +98,10 @@ class PrefectDeployedFlow(DeployedFlow):
         })
 
     @classmethod
-    def from_deployment(cls, identifier: str, metadata: Optional[str] = None) -> "PrefectDeployedFlow":
+    def from_deployment(cls, identifier: str, metadata: str | None = None) -> PrefectDeployedFlow:
         """Recover a PrefectDeployedFlow from a deployment identifier."""
         import json
+
         from .prefect_deployer import PrefectDeployer
 
         info = json.loads(identifier)
@@ -124,7 +125,7 @@ class PrefectDeployedFlow(DeployedFlow):
         PrefectTriggeredRun
         """
         # Convert kwargs to "key=value" strings for --run-param.
-        run_params = tuple("%s=%s" % (k, v) for k, v in kwargs.items())
+        run_params = tuple(f"{k}={v}" for k, v in kwargs.items())
 
         with temporary_fifo() as (attribute_file_path, attribute_file_fd):
             trigger_kwargs = dict(name=self.name, deployer_attribute_file=attribute_file_path)
@@ -153,8 +154,7 @@ class PrefectDeployedFlow(DeployedFlow):
                 return PrefectTriggeredRun(deployer=self.deployer, content=content)
 
         raise RuntimeError(
-            "Error triggering deployment %r on Prefect for flow %r"
-            % (self.name, self.deployer.flow_file)
+            f"Error triggering deployment {self.name!r} on Prefect for flow {self.deployer.flow_file!r}"
         )
 
     # Alias for backwards compatibility with test_utils.

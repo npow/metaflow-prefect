@@ -12,7 +12,6 @@ from metaflow_extensions.prefect.plugins.prefect.prefect_decorator import (
     PrefectInternalDecorator,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

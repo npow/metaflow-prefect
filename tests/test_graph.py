@@ -460,3 +460,148 @@ class TestDecoratorExtraction:
         spec = analyze_graph(graph, flow)
         for step in spec.steps:
             assert step.retry_delay_seconds is None
+
+
+class TestValidationAdversarial:
+    """Edge-case and adversarial validation tests targeting uncovered branches."""
+
+    def test_condition_raises(self) -> None:
+        """@condition decorator raises NotSupportedException."""
+        graph, flow = _make_mock_graph(deco_names=["condition"])
+        with pytest.raises(NotSupportedException, match="@condition"):
+            analyze_graph(graph, flow)
+
+    def test_unknown_node_type_falls_back_to_linear(self) -> None:
+        """An unrecognised node type string falls back to NodeType.LINEAR without error."""
+        from metaflow_extensions.prefect.plugins.prefect._graph import _topological_order
+
+        node = MagicMock()
+        node.name = "start"
+        node.type = "future_metaflow_node_type"  # not in NodeType enum
+        node.in_funcs = []
+        node.out_funcs = []
+        node.split_parents = []
+        node.decorators = []
+
+        graph = MagicMock()
+        graph.__iter__ = MagicMock(return_value=iter([node]))
+        graph.__getitem__ = MagicMock(return_value=node)
+
+        steps = _topological_order(graph)
+        assert len(steps) == 1
+        assert steps[0].node_type == NodeType.LINEAR
+
+    def test_schedule_cron_passthrough(self) -> None:
+        """@schedule(cron=...) passes the cron string through unchanged."""
+        from metaflow_extensions.prefect.plugins.prefect._graph import _extract_schedule
+
+        s = MagicMock()
+        s.attributes = {"cron": "*/5 * * * *"}
+        flow = MagicMock()
+        flow._flow_decorators = MagicMock()
+        flow._flow_decorators.get = MagicMock(return_value=[s])
+        assert _extract_schedule(flow) == "*/5 * * * *"
+
+    def test_schedule_weekly(self) -> None:
+        """@schedule(weekly=True) produces weekly cron string."""
+        from metaflow_extensions.prefect.plugins.prefect._graph import _extract_schedule
+
+        s = MagicMock()
+        s.attributes = {"weekly": True}
+        flow = MagicMock()
+        flow._flow_decorators = MagicMock()
+        flow._flow_decorators.get = MagicMock(return_value=[s])
+        assert _extract_schedule(flow) == "0 0 * * 0"
+
+    def test_schedule_hourly(self) -> None:
+        """@schedule(hourly=True) produces hourly cron string."""
+        from metaflow_extensions.prefect.plugins.prefect._graph import _extract_schedule
+
+        s = MagicMock()
+        s.attributes = {"hourly": True}
+        flow = MagicMock()
+        flow._flow_decorators = MagicMock()
+        flow._flow_decorators.get = MagicMock(return_value=[s])
+        assert _extract_schedule(flow) == "0 * * * *"
+
+    def test_schedule_daily(self) -> None:
+        """@schedule(daily=True) produces daily cron string."""
+        from metaflow_extensions.prefect.plugins.prefect._graph import _extract_schedule
+
+        s = MagicMock()
+        s.attributes = {"daily": True}
+        flow = MagicMock()
+        flow._flow_decorators = MagicMock()
+        flow._flow_decorators.get = MagicMock(return_value=[s])
+        assert _extract_schedule(flow) == "0 0 * * *"
+
+    def test_schedule_unknown_attrs_returns_none(self) -> None:
+        """@schedule with unrecognised attrs returns None rather than crashing."""
+        from metaflow_extensions.prefect.plugins.prefect._graph import _extract_schedule
+
+        s = MagicMock()
+        s.attributes = {"some_future_attr": True}
+        flow = MagicMock()
+        flow._flow_decorators = MagicMock()
+        flow._flow_decorators.get = MagicMock(return_value=[s])
+        assert _extract_schedule(flow) is None
+
+    def test_project_name_extracted(self) -> None:
+        """@project(name=...) populates FlowSpec.project_name."""
+        graph, flow = _make_mock_graph()
+        proj = MagicMock()
+        proj.attributes = {"name": "my_project"}
+        flow._flow_decorators = {"project": [proj]}
+        spec = analyze_graph(graph, flow)
+        assert spec.project_name == "my_project"
+
+    def test_trigger_non_dict_entry_skipped(self) -> None:
+        """A non-dict entry in the triggers list is silently skipped."""
+        graph, flow = _make_mock_graph()
+        trigger = MagicMock()
+        trigger.triggers = ["not_a_dict", {"name": "ok_event"}]
+        flow._flow_decorators = {"trigger": [trigger]}
+        spec = analyze_graph(graph, flow)
+        assert len(spec.triggers) == 1
+        assert spec.triggers[0].event_name == "ok_event"
+
+    def test_trigger_none_name_warns_and_skips(self) -> None:
+        """A trigger entry with a None name emits a UserWarning and is skipped."""
+        import warnings
+
+        graph, flow = _make_mock_graph()
+        trigger = MagicMock()
+        trigger.triggers = [{"name": None}, {"name": "good_event"}]
+        flow._flow_decorators = {"trigger": [trigger]}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spec = analyze_graph(graph, flow)
+        assert any("non-string" in str(w.message) for w in caught)
+        # The None-name entry is skipped; only "good_event" survives.
+        assert len(spec.triggers) == 1
+        assert spec.triggers[0].event_name == "good_event"
+
+    def test_trigger_on_finish_non_dict_entry_skipped(self) -> None:
+        """A non-dict entry in trigger_on_finish triggers is silently skipped."""
+        graph, flow = _make_mock_graph()
+        t = MagicMock()
+        t.triggers = [42, {"flow": "GoodFlow"}]
+        flow._flow_decorators = {"trigger_on_finish": [t]}
+        spec = analyze_graph(graph, flow)
+        assert len(spec.trigger_on_finishes) == 1
+        assert spec.trigger_on_finishes[0].flow_name == "GoodFlow"
+
+    def test_trigger_on_finish_missing_name_warns_and_skips(self) -> None:
+        """A trigger_on_finish entry with no flow name emits a UserWarning and is skipped."""
+        import warnings
+
+        graph, flow = _make_mock_graph()
+        t = MagicMock()
+        t.triggers = [{"flow": None}, {"flow": "RealFlow"}]
+        flow._flow_decorators = {"trigger_on_finish": [t]}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            spec = analyze_graph(graph, flow)
+        assert any("missing flow name" in str(w.message) for w in caught)
+        assert len(spec.trigger_on_finishes) == 1
+        assert spec.trigger_on_finishes[0].flow_name == "RealFlow"

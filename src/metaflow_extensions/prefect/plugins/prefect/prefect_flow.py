@@ -58,7 +58,7 @@ class PrefectFlow:
         self._flow = flow
         self._tags = list(tags or [])
         self._namespace = namespace
-        self._flow_file = flow_file or os.path.abspath(os.path.realpath(__file__))
+        self._flow_file = flow_file or os.path.realpath(__file__)
         env_type = getattr(environment, "TYPE", "local")
         event_logger_type = getattr(event_logger, "TYPE", "nullSidecarLogger")
         monitor_type = getattr(monitor, "TYPE", "nullSidecarMonitor")

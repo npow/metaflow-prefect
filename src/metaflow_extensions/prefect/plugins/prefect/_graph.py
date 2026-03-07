@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import warnings
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from metaflow.parameters import deploy_time_eval
 
@@ -22,11 +22,6 @@ from metaflow_extensions.prefect.plugins.prefect._types import (
     TriggerSpec,
 )
 from metaflow_extensions.prefect.plugins.prefect.exception import NotSupportedException
-
-if TYPE_CHECKING:
-    # Only used for type-checker hints; not imported at runtime to avoid
-    # pulling in heavy Metaflow internals.
-    from metaflow.flowgraph import FlowGraph
 
 
 def analyze_graph(
@@ -84,25 +79,25 @@ def _validate(graph: Any, flow: Any) -> None:
         for deco in node.decorators:
             if deco.name == "batch":
                 raise NotSupportedException(
-                    "Step *%s* uses @batch which is not supported with Prefect. "
-                    "Remove @batch or use --with=batch on the Prefect CLI instead." % node.name
+                    f"Step *{node.name}* uses @batch which is not supported with Prefect. "
+                    "Remove @batch or use --with=batch on the Prefect CLI instead."
                 )
             if deco.name == "slurm":
                 raise NotSupportedException(
-                    "Step *%s* uses @slurm which is not supported with Prefect." % node.name
+                    f"Step *{node.name}* uses @slurm which is not supported with Prefect."
                 )
             if deco.name == "condition":
                 raise NotSupportedException(
-                    "Step *%s* uses @condition which is not supported with Prefect. "
+                    f"Step *{node.name}* uses @condition which is not supported with Prefect. "
                     "Conditional branching via @condition produces incorrect generated "
-                    "code and must be removed." % node.name
+                    "code and must be removed."
                 )
             if deco.name == "resources":
                 warnings.warn(
-                    "Step *%s* uses @resources. Resource requirements are recorded as "
+                    f"Step *{node.name}* uses @resources. Resource requirements are recorded as "
                     "Prefect task tags (resource:cpu=N, resource:gpu=N, etc.) but are "
                     "NOT enforced — configure matching resources on your Prefect work pool "
-                    "to actually constrain execution." % node.name,
+                    "to actually constrain execution.",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -294,10 +289,7 @@ def _extract_parameters(flow: Any) -> list[ParameterSpec]:
 
 def _extract_schedule(flow: Any) -> str | None:
     """Return a cron string from an @schedule decorator, or None."""
-    try:
-        schedules = flow._flow_decorators.get("schedule")
-    except Exception:
-        return None
+    schedules = getattr(flow._flow_decorators, "get", lambda *_: None)("schedule")
     if not schedules:
         return None
     s = schedules[0]
@@ -334,8 +326,8 @@ def _extract_triggers(flow: Any) -> list[TriggerSpec]:
         name = t.get("name")
         if not name or not isinstance(name, str):
             warnings.warn(
-                "@trigger entry has a non-string or deploy-time event name %r — "
-                "skipping this trigger.  Evaluate the event name before deploying." % (name,),
+                f"@trigger entry has a non-string or deploy-time event name {name!r} — "
+                "skipping this trigger.  Evaluate the event name before deploying.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -361,8 +353,8 @@ def _extract_trigger_on_finishes(flow: Any) -> list[TriggerOnFinishSpec]:
         flow_name = t.get("flow") or t.get("fq_name")
         if not flow_name or not isinstance(flow_name, str):
             warnings.warn(
-                "@trigger_on_finish entry has a non-string or missing flow name %r — "
-                "skipping this trigger." % (flow_name,),
+                f"@trigger_on_finish entry has a non-string or missing flow name {flow_name!r} — "
+                "skipping this trigger.",
                 UserWarning,
                 stacklevel=2,
             )

@@ -15,12 +15,9 @@ from metaflow_extensions.prefect.plugins.prefect._codegen import (
 from metaflow_extensions.prefect.plugins.prefect._graph import analyze_graph
 from metaflow_extensions.prefect.plugins.prefect._types import (
     FlowSpec,
-    NodeType,
     ParameterSpec,
     PrefectFlowConfig,
-    StepSpec,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -567,7 +564,7 @@ class TestNestedForeachCodegen:
             "_step_start", "_step_outer_step", "_step_inner_step",
             "_step_inner_join", "_step_outer_join", "_step_end",
         ):
-            assert name in fns, "%s missing from generated file" % name
+            assert name in fns, f"{name} missing from generated file"
 
     def test_outer_step_returns_tuple(self, src: str) -> None:
         """outer_step is a foreach — must return (task_id, num_splits)."""
@@ -673,7 +670,7 @@ class TestTripleForeachCodegen:
             "_step_inner_step", "_step_inner_join", "_step_middle_join",
             "_step_outer_join", "_step_end",
         ):
-            assert name in fns, "%s missing from generated file" % name
+            assert name in fns, f"{name} missing from generated file"
 
     def test_three_foreach_steps_return_tuple(self, src: str) -> None:
         """start, outer_step, middle_step are all foreach — must return tuple."""
@@ -683,7 +680,7 @@ class TestTripleForeachCodegen:
             assert fn is not None
             if fn.returns:
                 assert "tuple" in ast.unparse(fn.returns).lower(), (
-                    "%s should return tuple" % fn_name
+                    f"{fn_name} should return tuple"
                 )
 
     def test_middle_step_submitted_in_comprehension(self, src: str) -> None:
@@ -701,14 +698,14 @@ class TestTripleForeachCodegen:
             if line.lstrip().startswith("for ") and "_tid" in line
         ]
         assert len(flow_body_lines) >= 2, (
-            "Expected at least 2 for loops for 3-level nested foreach, "
-            "got %d: %s" % (len(flow_body_lines), flow_body_lines)
+            f"Expected at least 2 for loops for 3-level nested foreach, "
+            f"got {len(flow_body_lines)}: {flow_body_lines}"
         )
 
     def test_all_joins_called(self, src: str) -> None:
         """All three join steps are invoked in the generated code."""
         for fn in ("_step_inner_join(", "_step_middle_join(", "_step_outer_join("):
-            assert fn in src, "%s not found in generated source" % fn
+            assert fn in src, f"{fn} not found in generated source"
 
     def test_inner_join_innermost_indented(self, src: str) -> None:
         """inner_join call is the most-deeply indented join (inside 2 for loops)."""
@@ -719,5 +716,69 @@ class TestTripleForeachCodegen:
         assert call_lines, "No call to _step_inner_join found"
         # Must be indented at least 8 spaces (inside 2 loops at 4-space indent each)
         assert len(call_lines[0]) - len(call_lines[0].lstrip()) >= 8, (
-            "inner_join call should be doubly-indented, got: %r" % call_lines[0]
+            f"inner_join call should be doubly-indented, got: {call_lines[0]!r}"
         )
+
+
+class TestMidForeachCodegen:
+    """Code-generation for a flow where the foreach is NOT the start step.
+
+    This covers the ``elif step.node_type == NodeType.FOREACH`` wiring branch
+    in ``_flow_wiring_lines`` (lines 630-643 of _codegen.py).
+    """
+
+    @pytest.fixture(scope="class")
+    def src(self, mid_foreach_flow_graph: tuple) -> str:
+        from metaflow_extensions.prefect.plugins.prefect._codegen import generate_prefect_file
+        from metaflow_extensions.prefect.plugins.prefect._graph import analyze_graph
+        from metaflow_extensions.prefect.plugins.prefect._types import PrefectFlowConfig
+
+        graph, flow = mid_foreach_flow_graph
+        spec = analyze_graph(graph, flow)
+        cfg = PrefectFlowConfig(flow_file="/tmp/mid_foreach_flow.py")
+        return generate_prefect_file(spec, cfg)
+
+    def test_compiles_without_error(self, src: str) -> None:
+        """Generated source is valid Python."""
+        import ast
+        ast.parse(src)
+
+    def test_foreach_mid_returns_tuple(self, src: str) -> None:
+        """The foreach_mid @task returns tuple[str, int] since it fans out."""
+        import ast
+        tree = ast.parse(src)
+        fns = {
+            n.name: n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef)
+        }
+        fn = fns.get("_step_foreach_mid")
+        assert fn is not None, "_step_foreach_mid not found"
+        assert fn.returns is not None
+        assert "tuple" in ast.unparse(fn.returns).lower()
+
+    def test_start_step_returns_str(self, src: str) -> None:
+        """The start @task returns str (it's a plain linear step)."""
+        import ast
+        tree = ast.parse(src)
+        fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        fn = fns.get("_step_start")
+        assert fn is not None
+        assert fn.returns is not None
+        assert ast.unparse(fn.returns) == "str"
+
+    def test_foreach_mid_wiring_uses_pair_variable(self, src: str) -> None:
+        """Flow body uses _tid_foreach_mid_pair to unpack task_id and nsplits."""
+        assert "_tid_foreach_mid_pair" in src
+
+    def test_body_submitted_in_list_comprehension(self, src: str) -> None:
+        """body tasks are submitted via list comprehension (.submit)."""
+        assert "_step_body.submit" in src
+
+    def test_all_steps_have_task_functions(self, src: str) -> None:
+        """Every step in the flow has a corresponding @task function."""
+        import ast
+        tree = ast.parse(src)
+        fns = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        for step in ("_step_start", "_step_foreach_mid", "_step_body", "_step_join", "_step_end"):
+            assert step in fns, f"{step} missing from generated file"

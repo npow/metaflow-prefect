@@ -5,10 +5,7 @@ import ast
 from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
-
 from metaflow_extensions.prefect.plugins.prefect.prefect_flow import PrefectFlow
-
 
 # ---------------------------------------------------------------------------
 # Helpers
