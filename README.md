@@ -270,7 +270,7 @@ names and a one-liner to fetch each value:
 | `@retry(times=N, minutes_between_retries=M)` | Maps to `@task(retries=N, retry_delay_seconds=M*60)` |
 | `@timeout(seconds=N)` / `@timeout(minutes=N)` | Maps to `@task(timeout_seconds=N)` |
 | `@environment(vars={...})` | Merges vars into the step subprocess environment |
-| `@resources(cpu=N, gpu=G, memory=M)` | Added as Prefect task tags; GPU steps get a concurrency tag. Advisory only — configure matching resources on the work pool. |
+| `@resources(cpu=N, gpu=G, memory=M)` | Forwarded as `--with=resources:cpu=N,memory=M,gpu=G` to the `metaflow step` subprocess so any compute backend (e.g. `@kubernetes`, `@batch`, `@sandbox`) receives the hints. Also added as Prefect task tags for UI visibility. |
 | `@schedule(cron=...)` | Used as the deployment cron schedule |
 | `@project(name=...)` | Prefixes the deployment name with the project name |
 | `@trigger(event=...)` | Creates a Prefect automation that fires the deployment on the named event |
@@ -284,7 +284,7 @@ raise a clear error at compile time.
 | Limitation | Detail |
 |---|---|
 | No `parallel_foreach` | `parallel_foreach=True` (Metaflow's MPI-style multi-node execution) requires `@batch` or `@kubernetes` backends and runs as a single distributed job, which has no Prefect equivalent. Raises an error at compile time. |
-| `@resources` tags are advisory | CPU/GPU/memory hints are added as Prefect task tags and are visible in the UI, but do not automatically allocate resources — configure matching resources on the work pool. |
+| `@resources` forwarding | CPU/GPU/memory hints are forwarded to the compute backend via `--with=resources:...` and also added as Prefect task tags. Configure matching resources on the work pool to enforce them. |
 | `@trigger` event scope | `@trigger(event="foo")` watches for a Prefect event named `"foo"`. Metaflow's own event system is separate from Prefect's — emit events via Prefect's event API to use this trigger. |
 
 ## Development
