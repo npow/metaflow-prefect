@@ -307,7 +307,12 @@ def trigger(
         k, _, v = kv.partition("=")
         params[k.strip()] = v.strip()
 
-    flow_name = obj.flow.name  # type: ignore[attr-defined]
+    # Build the Prefect flow name the same way create does: prefix with project
+    # name if @project is present, so trigger can find the right deployment.
+    from ._graph import _extract_project
+    project_name = _extract_project(obj.flow)  # type: ignore[attr-defined]
+    metaflow_flow_name = obj.flow.name  # type: ignore[attr-defined]
+    flow_name = f"{project_name}.{metaflow_flow_name}" if project_name else metaflow_flow_name
     asyncio.run(
         _trigger_deployment(
             flow_name=flow_name,
