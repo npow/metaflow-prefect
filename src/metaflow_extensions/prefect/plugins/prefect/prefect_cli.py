@@ -105,7 +105,6 @@ def compile(
         obj, output_file, tags, user_namespace, max_workers, with_decorators, workflow_timeout
     )
 
-    # type: ignore — obj is the Metaflow CLI context object
     obj.echo(  # type: ignore[attr-defined]
         "Prefect flow file written to *{out}*.\n"
         "Run it with:  python {out}\n"
@@ -149,7 +148,9 @@ def run(
     with_decorators: tuple[str, ...],
     workflow_timeout: int | None,
 ) -> None:
-    _compile_and_run_locally(obj, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
+    _compile_and_run_locally(
+        obj, tags, user_namespace, max_workers, with_decorators, workflow_timeout
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +413,7 @@ async def _register_deployment(
     echo: Callable[..., None],
     flow_spec: FlowSpec,
 ) -> None:
+    """Create or update a Prefect deployment and sync its automations."""
     try:
         from prefect.client.orchestration import get_client
     except ImportError:
@@ -507,7 +509,7 @@ async def _sync_automations(
             enabled=True,
         )))
 
-    desired_names = {auto_name for auto_name, _ in desired}
+    desired_names = {n for n, _ in desired}
 
     for auto_name, automation in desired:
         existing = await client.read_automations_by_name(auto_name)  # type: ignore[attr-defined]
@@ -546,7 +548,12 @@ async def _trigger_deployment(
     """Trigger a Prefect deployment run and optionally write run info to a file."""
     try:
         from prefect.client.orchestration import get_client
-        from prefect.client.schemas.filters import DeploymentFilter, DeploymentFilterName, FlowFilter, FlowFilterName
+        from prefect.client.schemas.filters import (
+            DeploymentFilter,
+            DeploymentFilterName,
+            FlowFilter,
+            FlowFilterName,
+        )
     except ImportError:
         raise PrefectException(
             "prefect is required for triggering deployments. "

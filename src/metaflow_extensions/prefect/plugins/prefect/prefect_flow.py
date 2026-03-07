@@ -89,7 +89,7 @@ class PrefectFlow:
         spec: FlowSpec = analyze_graph(self._graph, self._flow)
         # Overlay CLI-supplied tags/namespace (they may differ from flow decorators).
         # Use dataclasses.replace so all other fields (triggers, etc.) are preserved.
-        overrides: dict = {}
+        overrides: dict[str, Any] = {}
         if self._tags:
             overrides["tags"] = tuple(self._tags)
         if self._namespace is not None:
@@ -103,6 +103,7 @@ class PrefectFlow:
         """Build per-step command templates using initialized decorator objects."""
         from metaflow.runtime import CLIArgs as RuntimeCLIArgs
 
+        # These token strings must match the literals in _codegen._HELPERS._materialize_cmd.
         run_token = "__MF_RUN_ID__"
         task_token = "__MF_TASK_ID__"
         input_token = "__MF_INPUT_PATHS__"
@@ -114,6 +115,7 @@ class PrefectFlow:
         for step in spec.steps:
             try:
                 node = self._graph[step.name]
+                # Build a minimal duck-typed object that satisfies RuntimeCLIArgs.
                 task = type("_MFTask", (), {})()
                 task.entrypoint = [sys.executable, "-u", self._cfg.flow_file]
                 task.flow = self._flow

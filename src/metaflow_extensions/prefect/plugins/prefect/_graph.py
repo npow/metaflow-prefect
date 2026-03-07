@@ -213,9 +213,15 @@ def _topological_order(graph: Any) -> list[StepSpec]:
         visited.add(name)
 
         resource_cpu, resource_gpu, resource_memory = _step_resources(node)
+        # NodeType() raises ValueError for unknown types — fall back to LINEAR
+        # so new Metaflow node types don't crash compilation.
+        try:
+            node_type = NodeType(node.type)
+        except ValueError:
+            node_type = NodeType.LINEAR
         spec = StepSpec(
             name=node.name,
-            node_type=NodeType(node.type),
+            node_type=node_type,
             in_funcs=tuple(node.in_funcs),
             out_funcs=tuple(node.out_funcs),
             split_parents=tuple(node.split_parents),
@@ -334,8 +340,8 @@ def _extract_triggers(flow: Any) -> list[TriggerSpec]:
                 stacklevel=2,
             )
             continue
-        params: dict[str, str] = t.get("parameters") or {}
-        param_map = tuple(sorted(params.items())) if isinstance(params, dict) else ()
+        raw_params = t.get("parameters") or {}
+        param_map = tuple(sorted(raw_params.items())) if isinstance(raw_params, dict) else ()
         result.append(TriggerSpec(event_name=name, parameter_map=param_map))
     return result
 
