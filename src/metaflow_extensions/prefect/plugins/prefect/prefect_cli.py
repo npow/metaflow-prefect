@@ -101,7 +101,9 @@ def compile(
             "Output file name cannot be the same as the flow file name."
         )
 
-    _make_flow_and_write(obj, output_file, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
+    _make_flow_and_write(
+        obj, output_file, tags, user_namespace, max_workers, with_decorators, workflow_timeout
+    )
 
     # type: ignore — obj is the Metaflow CLI context object
     obj.echo(  # type: ignore[attr-defined]
@@ -241,7 +243,9 @@ def create(
 
     mf_spec = analyze_graph(obj.graph, obj.flow)  # type: ignore[attr-defined]
 
-    _make_flow_and_write(obj, flow_file_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
+    _make_flow_and_write(
+        obj, flow_file_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout
+    )
 
     mod_spec = importlib.util.spec_from_file_location("_mf_prefect_flow", flow_file_path)
     mod = importlib.util.module_from_spec(mod_spec)  # type: ignore[arg-type]

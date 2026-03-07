@@ -44,7 +44,7 @@ def analyze_graph(
 
     Raises:
         NotSupportedException: For graph features not yet handled by this integration.
-"""
+    """
     _validate(graph, flow)
 
     steps = _topological_order(graph)
@@ -288,7 +288,10 @@ def _extract_parameters(flow: Any) -> list[ParameterSpec]:
 
 def _extract_schedule(flow: Any) -> str | None:
     """Return a cron string from an @schedule decorator, or None."""
-    schedules = flow._flow_decorators.get("schedule")
+    try:
+        schedules = flow._flow_decorators.get("schedule")
+    except Exception:
+        return None
     if not schedules:
         return None
     s = schedules[0]
@@ -305,10 +308,7 @@ def _extract_schedule(flow: Any) -> str | None:
 
 def _extract_project(flow: Any) -> str | None:
     """Return the project name from @project(name=...), or None."""
-    try:
-        project_decos = flow._flow_decorators.get("project")
-    except Exception:
-        return None
+    project_decos = getattr(flow._flow_decorators, "get", lambda *_: None)("project")
     if not project_decos:
         return None
     return project_decos[0].attributes.get("name") or None
@@ -316,10 +316,7 @@ def _extract_project(flow: Any) -> str | None:
 
 def _extract_triggers(flow: Any) -> list[TriggerSpec]:
     """Return TriggerSpec entries from @trigger(event=...) or @trigger(events=[...])."""
-    try:
-        decos = flow._flow_decorators.get("trigger")
-    except Exception:
-        return []
+    decos = getattr(flow._flow_decorators, "get", lambda *_: None)("trigger")
     if not decos:
         return []
 
@@ -345,10 +342,7 @@ def _extract_triggers(flow: Any) -> list[TriggerSpec]:
 
 def _extract_trigger_on_finishes(flow: Any) -> list[TriggerOnFinishSpec]:
     """Return TriggerOnFinishSpec entries from @trigger_on_finish(flow=...) or flows=[...]."""
-    try:
-        decos = flow._flow_decorators.get("trigger_on_finish")
-    except Exception:
-        return []
+    decos = getattr(flow._flow_decorators, "get", lambda *_: None)("trigger_on_finish")
     if not decos:
         return []
 
