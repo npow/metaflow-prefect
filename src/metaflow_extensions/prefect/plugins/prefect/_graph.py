@@ -66,7 +66,6 @@ def analyze_graph(
         description=(flow.__doc__ or "").strip(),
         schedule_cron=schedule_cron,
         tags=tuple(tags_raw),
-        namespace=None,
         project_name=project_name,
         triggers=tuple(triggers),
         trigger_on_finishes=tuple(trigger_on_finishes),
@@ -258,15 +257,17 @@ def _param_kwarg(param: Any, key: str) -> Any:
     return value
 
 
+_TYPE_MAP: dict[str, str] = {
+    "int": "int",
+    "float": "float",
+    "bool": "bool",
+    "str": "str",
+    "NoneType": "str",
+}
+
+
 def _extract_parameters(flow: Any) -> list[ParameterSpec]:
     """Pull parameters from the flow and evaluate their default values."""
-    _type_map = {
-        "int": "int",
-        "float": "float",
-        "bool": "bool",
-        "str": "str",
-        "NoneType": "str",
-    }
     params: list[ParameterSpec] = []
     for _, param in flow._get_parameters():
         is_required = bool(_param_kwarg(param, "required"))
@@ -275,28 +276,19 @@ def _extract_parameters(flow: Any) -> list[ParameterSpec]:
         if is_required and raw_default is None:
             # Infer type from the 'type' kwarg when there is no default.
             type_arg = _param_kwarg(param, "type")
-            type_name = _type_map.get(getattr(type_arg, "__name__", "NoneType"), "str")
-            params.append(
-                ParameterSpec(
-                    name=param.name,
-                    default=None,
-                    description=_param_kwarg(param, "help") or "",
-                    type_name=type_name,
-                    required=True,
-                )
-            )
+            type_name = _TYPE_MAP.get(getattr(type_arg, "__name__", "NoneType"), "str")
+            default = None
         else:
             default = deploy_time_eval(raw_default)
-            type_name = _type_map.get(type(default).__name__, "str")
-            params.append(
-                ParameterSpec(
-                    name=param.name,
-                    default=default,
-                    description=_param_kwarg(param, "help") or "",
-                    type_name=type_name,
-                    required=False,
-                )
-            )
+            type_name = _TYPE_MAP.get(type(default).__name__, "str")
+
+        params.append(ParameterSpec(
+            name=param.name,
+            default=default,
+            description=_param_kwarg(param, "help") or "",
+            type_name=type_name,
+            required=is_required and raw_default is None,
+        ))
     return params
 
 
@@ -373,6 +365,13 @@ def _extract_trigger_on_finishes(flow: Any) -> list[TriggerOnFinishSpec]:
             continue
         # After _parse_fq_name, the dict has "flow" (plain name) and optionally "fq_name".
         flow_name = t.get("flow") or t.get("fq_name")
-        if flow_name and isinstance(flow_name, str):
-            result.append(TriggerOnFinishSpec(flow_name=flow_name))
+        if not flow_name or not isinstance(flow_name, str):
+            warnings.warn(
+                "@trigger_on_finish entry has a non-string or missing flow name %r — "
+                "skipping this trigger." % (flow_name,),
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        result.append(TriggerOnFinishSpec(flow_name=flow_name))
     return result

@@ -583,15 +583,12 @@ async def _trigger_deployment(
                 f,
             )
 
-    try:
-        obj.echo(  # type: ignore[attr-defined]
-            "Triggered Prefect flow run *{run_id}* (pathspec: *{pathspec}*).".format(
-                run_id=flow_run.id, pathspec=pathspec
-            ),
-            bold=True,
-        )
-    except Exception:
-        pass
+    obj.echo(  # type: ignore[attr-defined]
+        "Triggered Prefect flow run *{run_id}* (pathspec: *{pathspec}*).".format(
+            run_id=flow_run.id, pathspec=pathspec
+        ),
+        bold=True,
+    )
 
 
 

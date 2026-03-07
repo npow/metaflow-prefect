@@ -7,7 +7,7 @@ immutable value objects.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -80,7 +80,7 @@ class FlowSpec:
     parameters: tuple[ParameterSpec, ...]
     description: str = ""
     schedule_cron: str | None = None
-    tags: tuple[str, ...] = field(default_factory=tuple)
+    tags: tuple[str, ...] = ()
     namespace: str | None = None
     project_name: str | None = None    # from @project(name=...) if present
     triggers: tuple[TriggerSpec, ...] = ()           # from @trigger

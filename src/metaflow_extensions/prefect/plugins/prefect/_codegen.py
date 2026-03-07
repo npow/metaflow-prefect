@@ -22,6 +22,7 @@ calls required.
 
 from __future__ import annotations
 
+import re
 import textwrap
 from datetime import datetime
 from typing import Sequence
@@ -282,17 +283,11 @@ def _build_header(
         "FLOW_NAME: str = %r" % spec.name,
         "DATASTORE_TYPE: str = %r" % cfg.datastore_type,
         "METADATA_TYPE: str = %r" % cfg.metadata_type,
-        "ENVIRONMENT_TYPE: str = %r" % cfg.environment_type,
-        "EVENT_LOGGER_TYPE: str = %r" % cfg.event_logger_type,
-        "MONITOR_TYPE: str = %r" % cfg.monitor_type,
-        "DATASTORE_ROOT: str | None = %r" % cfg.datastore_root,
         "CODE_PACKAGE_URL: str = %r" % cfg.code_package_url,
         "CODE_PACKAGE_SHA: str = %r" % cfg.code_package_sha,
         "CODE_PACKAGE_METADATA: str = %r" % cfg.code_package_metadata,
-        "USERNAME: str = %r" % cfg.username,
         "TAGS: list[str] = %r" % list(spec.tags),
         "NAMESPACE: str | None = %r" % spec.namespace,
-        "SCHEDULE_CRON: str | None = %r" % spec.schedule_cron,
         "WITH_DECORATORS: list[str] = %r" % list(cfg.with_decorators),
         "ORIGIN_RUN_ID: str | None = %r" % cfg.origin_run_id,
         "STEP_CMD_TEMPLATES: dict[str, tuple[str, ...]] = %r" % dict(cmd_templates or {}),
@@ -301,7 +296,7 @@ def _build_header(
 
 
 # ---------------------------------------------------------------------------
-# Section 3 — per-step @task functions
+# Section 2 — per-step @task functions
 # ---------------------------------------------------------------------------
 
 
@@ -339,21 +334,22 @@ def _task_decorator(step: StepSpec) -> str:
     return "@task(%s)" % ", ".join(parts)
 
 
+def _foreach_body_steps(spec: FlowSpec) -> set[str]:
+    """Return the set of step names that are the immediate body of a foreach."""
+    return {s.out_funcs[0] for s in spec.steps if s.node_type == NodeType.FOREACH and s.out_funcs}
+
+
 def _task_signature(step: StepSpec, spec: FlowSpec) -> str:
     """Return the parameter list string for the @task function."""
     is_start = step.name == "start"
-    foreach_body_steps = {
-        s.out_funcs[0]
-        for s in spec.steps
-        if s.node_type == NodeType.FOREACH and s.out_funcs
-    }
+    foreach_body = _foreach_body_steps(spec)
     if is_start:
         return "run_id: str, parameters: dict[str, Any]"
     if step.is_foreach_join:
         return "run_id: str, parent_step: str, task_ids: list[str]"
     if step.is_split_join:
         return "run_id: str, parent_task_ids: dict[str, str]"
-    if step.name in foreach_body_steps:
+    if step.name in foreach_body:
         return "run_id: str, prev_task_id: str, split_index: int = 0"
     return "run_id: str, prev_task_id: str"
 
@@ -367,12 +363,7 @@ def _task_return_type(step: StepSpec) -> str:
 def _task_body_lines(step: StepSpec, spec: FlowSpec) -> list[str]:
     """Return the unindented body lines for a @task function."""
     is_start = step.name == "start"
-    foreach_body_steps = {
-        s.out_funcs[0]
-        for s in spec.steps
-        if s.node_type == NodeType.FOREACH and s.out_funcs
-    }
-    is_foreach_body = step.name in foreach_body_steps
+    is_foreach_body = step.name in _foreach_body_steps(spec)
 
     lines: list[str] = []
     lines.append("logger = get_run_logger()")
@@ -404,7 +395,7 @@ def _task_body_lines(step: StepSpec, spec: FlowSpec) -> list[str]:
     # For the start step, the init command runs first and defines param_task_id,
     # which input_paths then references.  For all other steps the assignment is safe.
     if is_start:
-        lines += _start_init_lines(spec)
+        lines += _start_init_lines()
 
     lines.append(_input_paths_line(step, spec))
 
@@ -463,7 +454,7 @@ def _ctx_inject_lines() -> list[str]:
     ]
 
 
-def _start_init_lines(spec: FlowSpec) -> list[str]:
+def _start_init_lines() -> list[str]:
     """Lines that run the Metaflow ``init`` command to register flow parameters."""
     return [
         "# --- _parameters init task ---",
@@ -510,7 +501,7 @@ def _artifact_lines(step: StepSpec) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Section 4 — @flow function
+# Section 3 — @flow function
 # ---------------------------------------------------------------------------
 
 
@@ -794,12 +785,22 @@ def _task_fn(step_name: str) -> str:
 
 def _python_name(flow_name: str) -> str:
     """Convert CamelCase flow name to snake_case."""
-    result = []
-    for i, ch in enumerate(flow_name):
-        if ch.isupper() and i > 0:
-            result.append("_")
-        result.append(ch.lower())
-    return "".join(result)
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", flow_name).lower()
+
+
+def _param_str(p: ParameterSpec) -> str:
+    """Return the source-code representation of one flow parameter."""
+    if p.required:
+        return '%s: %s' % (p.name, p.type_name)
+    if isinstance(p.default, bool):
+        return '%s: bool = %r' % (p.name, p.default)  # bool before int — bool is a subclass of int
+    if isinstance(p.default, int):
+        return '%s: int = %r' % (p.name, p.default)
+    if isinstance(p.default, float):
+        return '%s: float = %r' % (p.name, p.default)
+    if isinstance(p.default, str):
+        return '%s: str = %r' % (p.name, p.default)
+    return '%s: Any = %r' % (p.name, p.default)
 
 
 def _flow_signature(params: Sequence[ParameterSpec]) -> str:
@@ -808,19 +809,6 @@ def _flow_signature(params: Sequence[ParameterSpec]) -> str:
     Required params (no default) are emitted before optional ones so the
     generated signature is always valid Python.
     """
-    def _param_str(p: ParameterSpec) -> str:
-        if p.required:
-            return '%s: %s' % (p.name, p.type_name)
-        if isinstance(p.default, str):
-            return '%s: str = %r' % (p.name, p.default)
-        if isinstance(p.default, bool):
-            return '%s: bool = %r' % (p.name, p.default)  # bool before int
-        if isinstance(p.default, int):
-            return '%s: int = %r' % (p.name, p.default)
-        if isinstance(p.default, float):
-            return '%s: float = %r' % (p.name, p.default)
-        return '%s: Any = %r' % (p.name, p.default)
-
     required = [_param_str(p) for p in params if p.required]
     optional = [_param_str(p) for p in params if not p.required]
     return ", ".join(required + optional)
