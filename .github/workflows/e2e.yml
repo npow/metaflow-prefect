@@ -1,0 +1,65 @@
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      PREFECT_API_URL: http://127.0.0.1:4200/api
+      PREFECT_E2E_WORK_POOL: e2e-pool
+      # Tell Metaflow to use the local filesystem for everything.
+      METAFLOW_DEFAULT_METADATA: local
+      METAFLOW_DEFAULT_DATASTORE: local
+      METAFLOW_DEFAULT_ENVIRONMENT: local
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # -----------------------------------------------------------------------
+      # Prefect server
+      # -----------------------------------------------------------------------
+
+      - name: Start Prefect server
+        run: |
+          prefect server start &
+          # Wait until the API health endpoint responds (up to 60 s).
+          timeout 60 bash -c \
+            'until curl -sf http://127.0.0.1:4200/api/health > /dev/null; do sleep 2; done'
+          echo "Prefect server is ready."
+
+      # -----------------------------------------------------------------------
+      # Work pool + worker (needed for TestPrefectDeployment)
+      # -----------------------------------------------------------------------
+
+      - name: Create process work pool
+        run: prefect work-pool create --type process "$PREFECT_E2E_WORK_POOL"
+
+      - name: Start Prefect worker
+        run: |
+          prefect worker start --pool "$PREFECT_E2E_WORK_POOL" &
+          # Give the worker a moment to register with the server.
+          sleep 5
+
+      # -----------------------------------------------------------------------
+      # Tests
+      # -----------------------------------------------------------------------
+
+      - name: Run e2e tests
+        run: pytest -m e2e -v --tb=short
