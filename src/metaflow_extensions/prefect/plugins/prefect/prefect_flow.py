@@ -130,7 +130,10 @@ class PrefectFlow:
                 task.datastore_type = self._cfg.datastore_type
                 task.event_logger_type = self._cfg.event_logger_type
                 task.monitor_type = self._cfg.monitor_type
-                task.datastore_sysroot = self._cfg.datastore_root
+                # Don't bake the compile-time CWD path into step templates.
+                # The task body always sets METAFLOW_DATASTORE_SYSROOT_LOCAL=~
+                # in _extra_env, so steps and the init command both use ~.
+                task.datastore_sysroot = None
                 task.decos = list(node.decorators)
                 task.run_id = run_token
                 task.task_id = task_token
