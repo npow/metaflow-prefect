@@ -86,16 +86,6 @@ def _validate(graph: Any, flow: Any) -> None:
                 raise NotSupportedException(
                     f"Step *{node.name}* uses @slurm which is not supported with Prefect."
                 )
-            if deco.name == "resources":
-                warnings.warn(
-                    f"Step *{node.name}* uses @resources. Resource requirements are recorded as "
-                    "Prefect task tags (resource:cpu=N, resource:gpu=N, etc.) but are "
-                    "NOT enforced — configure matching resources on your Prefect work pool "
-                    "to actually constrain execution.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-
     # @trigger and @trigger_on_finish are extracted and wired as Prefect automations
     # during deployment — no validation needed here.
 

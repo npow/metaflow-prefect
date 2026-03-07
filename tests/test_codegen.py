@@ -483,6 +483,7 @@ class TestResourcesComment:
         assert "# NOTE: @resources(" in src
         assert "cpu=4" in src
         assert "memory=8192 MB" in src
+        assert "forwarded as --with=resources:" in src
 
     def test_gpu_comment_present(self, src: str) -> None:
         assert "gpu=1" in src

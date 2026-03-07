@@ -145,3 +145,40 @@ class TestPrefectFlowConfig:
         graph, flow = simple_flow_graph
         src = _make_prefect_flow(graph, flow, flow_file="/my/custom/flow.py").compile()
         assert "/my/custom/flow.py" in src
+
+
+# ---------------------------------------------------------------------------
+# compile() — @resources forwarded as --with=resources:... in step commands
+# ---------------------------------------------------------------------------
+
+
+class TestResourcesInStepCmd:
+    """@resources hints are baked into STEP_CMD_TEMPLATES as --with=resources:... args."""
+
+    def test_resources_forwarded_in_cmd_templates(
+        self, resources_flow_graph: tuple[Any, Any]
+    ) -> None:
+        """Steps with @resources produce resources:cpu=N,memory=M in STEP_CMD_TEMPLATES."""
+        graph, flow = resources_flow_graph
+        src = _make_prefect_flow(graph, flow).compile()
+        # The start step has @resources(cpu=4, memory=8192) — verify forwarded.
+        assert "resources:cpu=4,memory=8192" in src
+
+    def test_gpu_resources_forwarded(
+        self, resources_flow_graph: tuple[Any, Any]
+    ) -> None:
+        """Steps with @resources(gpu=N) include gpu= in the resources --with arg."""
+        graph, flow = resources_flow_graph
+        src = _make_prefect_flow(graph, flow).compile()
+        # The end step has @resources(gpu=1, memory=16384); Metaflow defaults cpu=1.
+        assert "resources:cpu=1,memory=16384,gpu=1" in src
+
+    def test_no_resources_no_with_arg(
+        self, simple_flow_graph: tuple[Any, Any]
+    ) -> None:
+        """Steps without @resources must NOT emit a resources:... --with arg."""
+        graph, flow = simple_flow_graph
+        src = _make_prefect_flow(graph, flow).compile()
+        assert "resources:cpu=" not in src
+        assert "resources:gpu=" not in src
+        assert "resources:memory=" not in src

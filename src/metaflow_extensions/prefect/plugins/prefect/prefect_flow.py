@@ -159,6 +159,20 @@ class PrefectFlow:
                 for deco in self._cfg.with_decorators:
                     if deco not in with_opts:
                         with_opts.append(deco)
+                # Forward @resources hints as a --with=resources:... arg so that
+                # Metaflow compute backends (e.g. @sandbox, @kubernetes, @batch)
+                # receive the resource constraints when the step subprocess runs.
+                if step.resource_cpu is not None or step.resource_memory is not None or step.resource_gpu is not None:
+                    resource_parts = []
+                    if step.resource_cpu is not None:
+                        resource_parts.append("cpu=%d" % step.resource_cpu)
+                    if step.resource_memory is not None:
+                        resource_parts.append("memory=%d" % step.resource_memory)
+                    if step.resource_gpu is not None:
+                        resource_parts.append("gpu=%d" % step.resource_gpu)
+                    resources_deco = "resources:%s" % ",".join(resource_parts)
+                    if resources_deco not in with_opts:
+                        with_opts.append(resources_deco)
                 args.top_level_options["with"] = with_opts
 
                 for deco in task.decos:

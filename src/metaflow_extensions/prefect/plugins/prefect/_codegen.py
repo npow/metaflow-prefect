@@ -395,7 +395,8 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
     lines: list[str] = []
     lines.append("logger = get_run_logger()")
 
-    # Resource hint comment — users must configure this at the Prefect work pool.
+    # Resource hint comment — resources are also forwarded as --with=resources:...
+    # to the metaflow step subprocess via STEP_CMD_TEMPLATES.
     resource_parts = []
     if step.resource_cpu is not None:
         resource_parts.append("cpu=%d" % step.resource_cpu)
@@ -405,7 +406,7 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
         resource_parts.append("memory=%d MB" % step.resource_memory)
     if resource_parts:
         lines.append(
-            "# NOTE: @resources(%s) — configure matching resources at the Prefect work pool."
+            "# NOTE: @resources(%s) — forwarded as --with=resources:... to the step subprocess."
             % ", ".join(resource_parts)
         )
 
