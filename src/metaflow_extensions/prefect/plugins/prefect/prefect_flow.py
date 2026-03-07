@@ -7,7 +7,9 @@ familiar shape.
 
 from __future__ import annotations
 
+import logging
 import os
+import sys
 from typing import Any
 
 from metaflow.util import get_username
@@ -15,7 +17,8 @@ from metaflow.util import get_username
 from metaflow_extensions.prefect.plugins.prefect._codegen import generate_prefect_file
 from metaflow_extensions.prefect.plugins.prefect._graph import analyze_graph
 from metaflow_extensions.prefect.plugins.prefect._types import FlowSpec, PrefectFlowConfig
-from metaflow_extensions.prefect.plugins.prefect.exception import PrefectException
+
+_log = logging.getLogger(__name__)
 
 
 class PrefectFlow:
@@ -82,7 +85,7 @@ class PrefectFlow:
             monitor_type=(
                 str(monitor_type) if isinstance(monitor_type, str) else "nullSidecarMonitor"
             ),
-            datastore_root=str(datastore_root) if isinstance(datastore_root, str) else None,
+            datastore_root=str(datastore_root) if datastore_root is not None else None,
             username=username or get_username(),
             max_workers=max_workers,
             with_decorators=tuple(with_decorators or []),
@@ -92,19 +95,18 @@ class PrefectFlow:
 
     def compile(self) -> str:
         """Return the full Python source of the generated Prefect flow file."""
+        from dataclasses import replace
+
         spec: FlowSpec = analyze_graph(self._graph, self._flow)
-        # Overlay CLI-supplied tags/namespace (they may differ from flow decorators)
-        if self._tags or self._namespace:
-            spec = FlowSpec(
-                name=spec.name,
-                steps=spec.steps,
-                parameters=spec.parameters,
-                description=spec.description,
-                schedule_cron=spec.schedule_cron,
-                tags=tuple(self._tags) if self._tags else spec.tags,
-                namespace=self._namespace if self._namespace is not None else spec.namespace,
-                project_name=spec.project_name,
-            )
+        # Overlay CLI-supplied tags/namespace (they may differ from flow decorators).
+        # Use dataclasses.replace so all other fields (triggers, etc.) are preserved.
+        overrides: dict = {}
+        if self._tags:
+            overrides["tags"] = tuple(self._tags)
+        if self._namespace is not None:
+            overrides["namespace"] = self._namespace
+        if overrides:
+            spec = replace(spec, **overrides)
         cmd_templates = self._build_step_cmd_templates(spec)
         return generate_prefect_file(spec, self._cfg, cmd_templates=cmd_templates)
 
@@ -124,7 +126,7 @@ class PrefectFlow:
             try:
                 node = self._graph[step.name]
                 task = type("_MFTask", (), {})()
-                task.entrypoint = [os.sys.executable, "-u", self._cfg.flow_file]
+                task.entrypoint = [sys.executable, "-u", self._cfg.flow_file]
                 task.flow = self._flow
                 task.step = step.name
                 task.metadata_type = self._cfg.metadata_type
@@ -186,7 +188,13 @@ class PrefectFlow:
                 args.command_options["split-index"] = split_token
 
                 templates[step.name] = tuple(args.get_args())
-            except Exception:
+            except Exception as exc:
+                _log.debug(
+                    "Could not build command template for step %r; "
+                    "falling back to generic command: %s",
+                    step.name,
+                    exc,
+                )
                 continue
 
         return templates

@@ -20,6 +20,7 @@ from metaflow.exception import MetaflowException
 from metaflow.package import MetaflowPackage
 from metaflow.util import get_username
 
+from metaflow_extensions.prefect.plugins.prefect._codegen import _python_name
 from metaflow_extensions.prefect.plugins.prefect._graph import analyze_graph
 from metaflow_extensions.prefect.plugins.prefect._types import FlowSpec
 from metaflow_extensions.prefect.plugins.prefect.exception import (
@@ -631,10 +632,3 @@ def _resolve_name(obj: object) -> str:
     return name
 
 
-def _python_name(flow_name: str) -> str:
-    result: list[str] = []
-    for i, ch in enumerate(flow_name):
-        if ch.isupper() and i > 0:
-            result.append("_")
-        result.append(ch.lower())
-    return "".join(result)
