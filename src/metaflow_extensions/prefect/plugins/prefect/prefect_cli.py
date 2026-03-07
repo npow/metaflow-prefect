@@ -4,7 +4,9 @@ Commands
 --------
 compile  Compile the flow to a Prefect flow Python file.
 run      Compile and immediately run the flow via Prefect (local execution).
+resume   Re-run a failed flow, reusing outputs from steps that already succeeded.
 create   Register the flow as a named Prefect deployment on the active server.
+trigger  Trigger a run for a previously deployed Prefect deployment.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ from metaflow.exception import MetaflowException
 from metaflow.package import MetaflowPackage
 from metaflow.util import get_username
 
+from metaflow_extensions.prefect.plugins.prefect._graph import analyze_graph
+from metaflow_extensions.prefect.plugins.prefect._types import FlowSpec
 from metaflow_extensions.prefect.plugins.prefect.exception import (
     NotSupportedException,
     PrefectException,
@@ -164,6 +168,60 @@ def run(
 
 
 # ---------------------------------------------------------------------------
+# prefect resume
+# ---------------------------------------------------------------------------
+
+
+@prefect.command(help="Resume a failed Metaflow run via Prefect (locally).")
+@click.option(
+    "--clone-run-id",
+    required=True,
+    help="Metaflow run ID to resume from (e.g. prefect-<uuid>).",
+)
+@click.option("--tag", "tags", multiple=True, default=None,
+              help="Tag for the Metaflow run (repeatable).")
+@click.option("--namespace", "user_namespace", default=None)
+@click.option("--max-workers", default=10, show_default=True)
+@click.option("--with", "with_decorators", multiple=True, default=None,
+              help="Inject a decorator on every step (repeatable).")
+@click.option("--workflow-timeout", default=None, type=int,
+              help="Flow-level timeout in seconds.")
+@click.pass_obj
+def resume(
+    obj: object,
+    clone_run_id: str,
+    tags: tuple[str, ...],
+    user_namespace: str | None,
+    max_workers: int,
+    with_decorators: tuple[str, ...],
+    workflow_timeout: int | None,
+) -> None:
+    import importlib.util
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".py", delete=False, mode="w", dir=os.getcwd()
+    ) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        _make_flow_and_write(
+            obj, tmp_path, tags, user_namespace, max_workers,
+            with_decorators, workflow_timeout,
+            origin_run_id=clone_run_id,
+        )
+        spec = importlib.util.spec_from_file_location("_mf_prefect_flow", tmp_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+        flow_fn_name = _python_name(obj.flow.name)  # type: ignore[attr-defined]
+        getattr(mod, flow_fn_name)()
+    finally:
+        os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # prefect create
 # ---------------------------------------------------------------------------
 
@@ -230,6 +288,7 @@ def create(
     prefect_flow_fn = getattr(mod, flow_fn_name)
 
     schedule_cron = _get_schedule_cron(obj.flow)  # type: ignore[attr-defined]
+    mf_spec = analyze_graph(obj.graph, obj.flow)  # type: ignore[attr-defined]
 
     asyncio.run(
         _register_deployment(
@@ -240,6 +299,7 @@ def create(
             paused=paused,
             tags=list(tags),
             obj=obj,
+            flow_spec=mf_spec,
         )
     )
 
@@ -312,6 +372,7 @@ def _make_flow_and_write(
     max_workers: int,
     with_decorators: tuple[str, ...] = (),
     workflow_timeout: int | None = None,
+    origin_run_id: str | None = None,
 ) -> None:
     package = MetaflowPackage(
         obj.flow,                # type: ignore[attr-defined]
@@ -343,6 +404,7 @@ def _make_flow_and_write(
         flow_file=os.path.abspath(sys.argv[0]),
         with_decorators=list(with_decorators),
         workflow_timeout=workflow_timeout,
+        origin_run_id=origin_run_id,
     )
     source = pf.compile()
     with open(output_file, "w") as f:
@@ -357,6 +419,7 @@ async def _register_deployment(
     paused: bool,
     tags: list[str],
     obj: object,
+    flow_spec: FlowSpec | None = None,
 ) -> None:
     try:
         from prefect.client.orchestration import get_client
@@ -386,12 +449,84 @@ async def _register_deployment(
 
     apply_result = deployment.apply()
     deployment_id = await apply_result if asyncio.iscoroutine(apply_result) else apply_result
+
+    if flow_spec and (flow_spec.triggers or flow_spec.trigger_on_finishes):
+        async with get_client() as client:
+            await _sync_automations(client, deployment_id, name, flow_spec, obj)
+
     obj.echo(  # type: ignore[attr-defined]
         "Deployment *{name}* registered with id *{id}*.".format(
             name=name, id=deployment_id
         ),
         bold=True,
     )
+
+
+async def _sync_automations(
+    client: object,
+    deployment_id: object,
+    deployment_name: str,
+    spec: FlowSpec,
+    obj: object,
+) -> None:
+    """Upsert Prefect automations for @trigger and @trigger_on_finish decorators.
+
+    Each automation is named deterministically so that re-running ``prefect create``
+    updates existing automations rather than creating duplicates.
+    """
+    from prefect.events.actions import RunDeployment
+    from prefect.events.schemas.automations import AutomationCore, EventTrigger, Posture
+
+    action = RunDeployment(source="selected", deployment_id=deployment_id)
+
+    desired: list[tuple[str, AutomationCore]] = []
+
+    for trigger in spec.triggers:
+        auto_name = "metaflow/%s: on event '%s'" % (deployment_name, trigger.event_name)
+        event_trigger = EventTrigger(
+            expect={trigger.event_name},
+            posture=Posture.Reactive,
+            threshold=1,
+            within=0,
+        )
+        desired.append((auto_name, AutomationCore(
+            name=auto_name,
+            trigger=event_trigger,
+            actions=[action],
+            enabled=True,
+        )))
+
+    for tof in spec.trigger_on_finishes:
+        auto_name = "metaflow/%s: on finish of '%s'" % (deployment_name, tof.flow_name)
+        event_trigger = EventTrigger(
+            match_related={
+                "prefect.resource.role": "flow",
+                "prefect.resource.name": tof.flow_name,
+            },
+            expect={"prefect.flow-run.Completed"},
+            posture=Posture.Reactive,
+            threshold=1,
+            within=0,
+        )
+        desired.append((auto_name, AutomationCore(
+            name=auto_name,
+            trigger=event_trigger,
+            actions=[action],
+            enabled=True,
+        )))
+
+    for auto_name, automation in desired:
+        existing = await client.read_automations_by_name(auto_name)  # type: ignore[attr-defined]
+        if existing:
+            await client.update_automation(existing[0].id, automation)  # type: ignore[attr-defined]
+            obj.echo(  # type: ignore[attr-defined]
+                "Automation *{name}* updated.".format(name=auto_name), bold=False
+            )
+        else:
+            await client.create_automation(automation)  # type: ignore[attr-defined]
+            obj.echo(  # type: ignore[attr-defined]
+                "Automation *{name}* created.".format(name=auto_name), bold=False
+            )
 
 
 async def _trigger_deployment(

@@ -17,6 +17,8 @@ from metaflow_extensions.prefect.plugins.prefect._types import (
     NodeType,
     ParameterSpec,
     StepSpec,
+    TriggerOnFinishSpec,
+    TriggerSpec,
 )
 from metaflow_extensions.prefect.plugins.prefect.exception import (
     NotSupportedException,
@@ -53,6 +55,8 @@ def analyze_graph(
     schedule_cron = _extract_schedule(flow)
     tags_raw = getattr(flow, "_tags", None) or []
     project_name = _extract_project(flow)
+    triggers = _extract_triggers(flow)
+    trigger_on_finishes = _extract_trigger_on_finishes(flow)
 
     return FlowSpec(
         name=flow.name,
@@ -63,6 +67,8 @@ def analyze_graph(
         tags=tuple(tags_raw),
         namespace=None,
         project_name=project_name,
+        triggers=tuple(triggers),
+        trigger_on_finishes=tuple(trigger_on_finishes),
     )
 
 
@@ -91,8 +97,6 @@ def _validate(graph: Any, flow: Any) -> None:
                 raise NotSupportedException(
                     "Step *%s* uses @slurm which is not supported with Prefect." % node.name
                 )
-        # Nested foreach is supported at arbitrary depth — no limit here.
-        for deco in node.decorators:
             if deco.name == "condition":
                 raise NotSupportedException(
                     "Step *%s* uses @condition which is not supported with Prefect. "
@@ -109,16 +113,17 @@ def _validate(graph: Any, flow: Any) -> None:
                     stacklevel=2,
                 )
 
-    # Flow-level decorator checks
-    for bad_deco in ("trigger", "trigger_on_finish", "exit_hook"):
-        try:
-            decos = flow._flow_decorators.get(bad_deco)
-        except Exception:
-            decos = None
-        if decos:
-            raise NotSupportedException(
-                "@%s is not supported with Prefect deployments." % bad_deco
-            )
+    # @trigger and @trigger_on_finish are extracted and wired as Prefect automations
+    # during deployment — no validation needed here.
+
+    try:
+        decos = flow._flow_decorators.get("exit_hook")
+    except Exception:
+        decos = None
+    if decos:
+        raise NotSupportedException(
+            "@exit_hook is not supported with Prefect deployments."
+        )
 
 
 def _max_user_code_retries(node: Any) -> int:
@@ -322,3 +327,47 @@ def _extract_project(flow: Any) -> str | None:
     if not project_decos:
         return None
     return project_decos[0].attributes.get("name") or None
+
+
+def _extract_triggers(flow: Any) -> list[TriggerSpec]:
+    """Return TriggerSpec entries from @trigger(event=...) or @trigger(events=[...])."""
+    try:
+        decos = flow._flow_decorators.get("trigger")
+    except Exception:
+        return []
+    if not decos:
+        return []
+
+    raw_triggers = getattr(decos[0], "triggers", None) or []
+    result: list[TriggerSpec] = []
+    for t in raw_triggers:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name")
+        if not name or not isinstance(name, str):
+            continue
+        params: dict[str, str] = t.get("parameters") or {}
+        param_map = tuple(sorted(params.items())) if isinstance(params, dict) else ()
+        result.append(TriggerSpec(event_name=name, parameter_map=param_map))
+    return result
+
+
+def _extract_trigger_on_finishes(flow: Any) -> list[TriggerOnFinishSpec]:
+    """Return TriggerOnFinishSpec entries from @trigger_on_finish(flow=...) or flows=[...]."""
+    try:
+        decos = flow._flow_decorators.get("trigger_on_finish")
+    except Exception:
+        return []
+    if not decos:
+        return []
+
+    raw_triggers = getattr(decos[0], "triggers", None) or []
+    result: list[TriggerOnFinishSpec] = []
+    for t in raw_triggers:
+        if not isinstance(t, dict):
+            continue
+        # After _parse_fq_name, the dict has "flow" (plain name) and optionally "fq_name".
+        flow_name = t.get("flow") or t.get("fq_name")
+        if flow_name and isinstance(flow_name, str):
+            result.append(TriggerOnFinishSpec(flow_name=flow_name))
+    return result

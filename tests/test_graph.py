@@ -7,7 +7,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from metaflow_extensions.prefect.plugins.prefect._graph import analyze_graph
-from metaflow_extensions.prefect.plugins.prefect._types import FlowSpec, NodeType
+from metaflow_extensions.prefect.plugins.prefect._types import (
+    FlowSpec,
+    NodeType,
+    TriggerOnFinishSpec,
+    TriggerSpec,
+)
 from metaflow_extensions.prefect.plugins.prefect.exception import NotSupportedException
 
 
@@ -272,19 +277,41 @@ class TestValidation:
         with pytest.raises(NotSupportedException, match="@slurm"):
             analyze_graph(graph, flow)
 
-    def test_trigger_raises(self) -> None:
+    def test_trigger_does_not_raise(self) -> None:
         graph, flow = _make_mock_graph()
         trigger = MagicMock()
+        trigger.triggers = [{"name": "my_event", "parameters": {}}]
         flow._flow_decorators = {"trigger": [trigger]}
-        with pytest.raises(NotSupportedException, match="@trigger"):
-            analyze_graph(graph, flow)
+        # Should not raise — @trigger is handled via Prefect automations.
+        analyze_graph(graph, flow)
 
-    def test_trigger_on_finish_raises(self) -> None:
+    def test_trigger_extracted_into_spec(self) -> None:
+        graph, flow = _make_mock_graph()
+        trigger = MagicMock()
+        trigger.triggers = [{"name": "data.ready", "parameters": {"x": "y"}}]
+        flow._flow_decorators = {"trigger": [trigger]}
+        spec = analyze_graph(graph, flow)
+        assert len(spec.triggers) == 1
+        assert spec.triggers[0] == TriggerSpec(
+            event_name="data.ready", parameter_map=(("x", "y"),)
+        )
+
+    def test_trigger_on_finish_does_not_raise(self) -> None:
         graph, flow = _make_mock_graph()
         t = MagicMock()
+        t.triggers = [{"fq_name": "OtherFlow", "flow": "OtherFlow"}]
         flow._flow_decorators = {"trigger_on_finish": [t]}
-        with pytest.raises(NotSupportedException, match="@trigger_on_finish"):
-            analyze_graph(graph, flow)
+        # Should not raise — @trigger_on_finish is handled via Prefect automations.
+        analyze_graph(graph, flow)
+
+    def test_trigger_on_finish_extracted_into_spec(self) -> None:
+        graph, flow = _make_mock_graph()
+        t = MagicMock()
+        t.triggers = [{"fq_name": "OtherFlow", "flow": "OtherFlow"}]
+        flow._flow_decorators = {"trigger_on_finish": [t]}
+        spec = analyze_graph(graph, flow)
+        assert len(spec.trigger_on_finishes) == 1
+        assert spec.trigger_on_finishes[0] == TriggerOnFinishSpec(flow_name="OtherFlow")
 
     def test_exit_hook_raises(self) -> None:
         graph, flow = _make_mock_graph()

@@ -28,24 +28,37 @@ pip install -e ".[dev]"
 ## Quick start
 
 ```bash
-python my_flow.py prefect create my_flow_prefect.py
-python my_flow_prefect.py
+# Compile and run locally (no Prefect server needed)
+python my_flow.py prefect run
+
+# Register as a named deployment on a Prefect server
+python my_flow.py prefect create --name prod --work-pool my-pool
 ```
 
 ## Usage
 
-### Generate and run a Prefect flow
+### Commands
+
+| Command | Description |
+|---|---|
+| `prefect run` | Compile and run the flow via Prefect locally (ephemeral, no server needed). |
+| `prefect resume --clone-run-id <id>` | Re-run a failed flow, skipping steps that already succeeded. |
+| `prefect compile <output.py>` | Write the generated Prefect flow file without running it. |
+| `prefect create --name <name>` | Register a named deployment on a running Prefect server. |
+| `prefect trigger --name <name>` | Trigger a run for an existing deployment. |
 
 ```bash
-# Write the generated file and run it directly
-python my_flow.py prefect create my_flow_prefect.py
-python my_flow_prefect.py
-
-# Or compile and run in one step
+# Run locally
 python my_flow.py prefect run
 
-# Register a named deployment on a Prefect server
-python my_flow.py prefect deploy --name prod --work-pool my-pool
+# Resume a failed run (reuses already-completed step outputs)
+python my_flow.py prefect resume --clone-run-id prefect-<uuid>
+
+# Deploy to a Prefect server
+python my_flow.py prefect create --name prod --work-pool my-pool
+
+# Trigger a run of the deployed flow
+python my_flow.py prefect trigger --name prod
 ```
 
 ### All graph shapes are supported
@@ -81,14 +94,16 @@ class ForeachFlow(FlowSpec):
 Parameters defined with `metaflow.Parameter` are forwarded automatically:
 
 ```bash
-python param_flow.py prefect create param_flow_prefect.py
+python param_flow.py prefect run
+# Or pass parameters at the CLI:
+python param_flow.py prefect compile param_flow_prefect.py
 python param_flow_prefect.py --message "hello" --count 5
 ```
 
 ### Step decorator support
 
-`@retry`, `@timeout`, and `@environment` decorators are read from your flow and applied
-to the generated Prefect tasks automatically — no changes to your flow code required.
+`@retry`, `@timeout`, `@environment`, and `@resources` decorators are read from your flow
+and applied to the generated Prefect tasks automatically — no changes to your flow code required.
 
 ```python
 class MyFlow(FlowSpec):
@@ -109,6 +124,43 @@ def _step_train(run_id, prev_task_id):
     ...
 ```
 
+### Event-based triggers
+
+`@trigger` and `@trigger_on_finish` are wired as Prefect automations when the deployment
+is registered. Re-running `prefect create` updates the automations in place.
+
+```python
+@trigger_on_finish(flow="UpstreamFlow")
+class MyFlow(FlowSpec):
+    ...
+```
+
+```bash
+python my_flow.py prefect create --name prod --work-pool my-pool
+# → Registers deployment AND creates a Prefect automation:
+#   "on prefect.flow-run.Completed for flow 'UpstreamFlow' → run deployment 'prod'"
+```
+
+```python
+@trigger(event="data.ready")
+class MyFlow(FlowSpec):
+    ...
+```
+
+```bash
+python my_flow.py prefect create --name prod --work-pool my-pool
+# → Registers deployment AND creates a Prefect automation:
+#   "on event 'data.ready' → run deployment 'prod'"
+```
+
+### Resume failed runs
+
+Pass `--clone-run-id` to reuse outputs from steps that already succeeded in a previous run:
+
+```bash
+python my_flow.py prefect resume --clone-run-id prefect-<uuid-of-failed-run>
+```
+
 ## Configuration
 
 ### Metadata service and datastore
@@ -124,7 +176,7 @@ To use a remote metadata service or object store, configure them before running 
 python my_flow.py \
   --metadata=service \
   --datastore=s3 \
-  prefect create my_flow_prefect.py
+  prefect create --name prod --work-pool my-pool
 ```
 
 Or via environment variables (applied to all flows):
@@ -132,13 +184,13 @@ Or via environment variables (applied to all flows):
 ```bash
 export METAFLOW_DEFAULT_METADATA=service
 export METAFLOW_DEFAULT_DATASTORE=s3
-python my_flow.py prefect create my_flow_prefect.py
+python my_flow.py prefect create --name prod --work-pool my-pool
 ```
 
 ### Flow-level timeout
 
 ```bash
-python my_flow.py prefect create my_flow_prefect.py --workflow-timeout=3600
+python my_flow.py prefect create --name prod --workflow-timeout=3600
 ```
 
 ### Step decorators (`--with`)
@@ -147,10 +199,10 @@ Inject Metaflow step decorators at deploy time without modifying the flow source
 
 ```bash
 # Run each step inside a sandbox (e.g. metaflow-sandbox extension)
-python my_flow.py prefect create my_flow_prefect.py --with=sandbox
+python my_flow.py prefect run --with=sandbox
 
-# Multiple decorators are supported
-python my_flow.py prefect deploy --name prod \
+# Multiple decorators supported at deployment time
+python my_flow.py prefect create --name prod \
   --with=sandbox \
   --with="resources:cpu=4,memory=8000"
 ```
@@ -167,7 +219,7 @@ class MyFlow(FlowSpec):
 
 ```bash
 # Deployment will be registered as "my-team.MyFlow"
-python my_flow.py prefect deploy --name prod
+python my_flow.py prefect create --name prod
 ```
 
 ## How it works
@@ -176,10 +228,12 @@ python my_flow.py prefect deploy --name prod
 Each Metaflow step becomes a `@task`. The generated file:
 
 - runs each step as a subprocess via the standard `metaflow step` CLI
+- streams stdout and stderr from each step subprocess to the Prefect logger in real time
 - passes `--input-paths` correctly for joins and foreach splits
 - runs foreach body tasks concurrently via Prefect's task runner
-- maps `@retry`, `@timeout`, and `@environment` decorators to Prefect task settings
+- maps `@retry`, `@timeout`, `@environment`, and `@resources` decorators to Prefect task settings
 - writes Metaflow artifacts to the Prefect UI as markdown artifacts with a ready-to-use retrieval snippet
+- creates Prefect automations for `@trigger` and `@trigger_on_finish` when deploying
 
 ### Prefect UI: flow run timeline
 
@@ -202,19 +256,23 @@ names and a one-liner to fetch each value:
 | `@retry(times=N, minutes_between_retries=M)` | Maps to `@task(retries=N, retry_delay_seconds=M*60)` |
 | `@timeout(seconds=N)` / `@timeout(minutes=N)` | Maps to `@task(timeout_seconds=N)` |
 | `@environment(vars={...})` | Merges vars into the step subprocess environment |
+| `@resources(cpu=N, gpu=G, memory=M)` | Added as Prefect task tags; GPU steps get a concurrency tag. Advisory only — configure matching resources on the work pool. |
 | `@schedule(cron=...)` | Used as the deployment cron schedule |
 | `@project(name=...)` | Prefixes the deployment name with the project name |
+| `@trigger(event=...)` | Creates a Prefect automation that fires the deployment on the named event |
+| `@trigger_on_finish(flow=...)` | Creates a Prefect automation that fires the deployment when the upstream Prefect flow completes |
 
-Unsupported decorators (`@batch`, `@slurm`, `@trigger`, `@trigger_on_finish`, `@exit_hook`,
-`@parallel`) raise a clear error at compile time.
+Unsupported decorators (`@batch`, `@slurm`, `@condition`, `@exit_hook`, `@parallel`)
+raise a clear error at compile time.
 
 ## Limitations
 
 | Limitation | Detail |
 |---|---|
 | No `@condition` support | Metaflow's conditional branching (`@condition`) is not supported — it raises a compile-time error to prevent generating incorrect code. |
-| No `parallel_foreach` | `parallel_foreach=True` (Metaflow's MPI-style multi-node execution) is a genuine architectural limitation — it requires `@batch` or `@kubernetes` backends and runs as a single distributed job, which has no Prefect equivalent. Raises an error at compile time. |
-| `@resources` adds Prefect tags | CPU/GPU/memory hints from `@resources` are added as `tags=["resource:cpu=N", ...]` on the generated `@task`. GPU steps also receive `task_run_concurrency_tags=["gpu"]` for rate-limiting. These tags are visible in the Prefect UI but do not automatically allocate resources — configure matching resources on the work pool. **Sandbox users**: use `@sandbox(cpu=N, gpu=G)` for actual resource allocation; `@resources` tags remain advisory. |
+| No `parallel_foreach` | `parallel_foreach=True` (Metaflow's MPI-style multi-node execution) requires `@batch` or `@kubernetes` backends and runs as a single distributed job, which has no Prefect equivalent. Raises an error at compile time. |
+| `@resources` tags are advisory | CPU/GPU/memory hints are added as Prefect task tags and are visible in the UI, but do not automatically allocate resources — configure matching resources on the work pool. |
+| `@trigger` event scope | `@trigger(event="foo")` watches for a Prefect event named `"foo"`. Metaflow's own event system is separate from Prefect's — emit events via Prefect's event API to use this trigger. |
 
 ## Development
 

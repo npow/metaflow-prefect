@@ -66,11 +66,29 @@ _HELPERS = textwrap.dedent('''\
 
 
     def _run_cmd(cmd: list[str], extra_env: dict[str, str] | None = None) -> None:
-        """Execute cmd as a subprocess, inheriting stdout/stderr."""
+        """Execute cmd as a subprocess, streaming stdout/stderr to the Prefect logger."""
         env = os.environ.copy()
         if extra_env:
             env.update(extra_env)
-        subprocess.run(cmd, env=env, check=True)
+        logger = get_run_logger()
+        proc = subprocess.Popen(
+            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+
+        def _stream(pipe, log_fn):
+            for line in iter(pipe.readline, ""):
+                log_fn(line.rstrip())
+            pipe.close()
+
+        t_out = threading.Thread(target=_stream, args=(proc.stdout, logger.info), daemon=True)
+        t_err = threading.Thread(target=_stream, args=(proc.stderr, logger.warning), daemon=True)
+        t_out.start()
+        t_err.start()
+        t_out.join()
+        t_err.join()
+        proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
     def _mf_artifact_names(run_id: str, step_name: str, task_id: str) -> list[str]:
@@ -104,6 +122,12 @@ _HELPERS = textwrap.dedent('''\
             "--metadata", METADATA_TYPE,
             "--no-pylint",
             "--with=prefect_internal",
+        ]
+        for _deco in WITH_DECORATORS:
+            cmd += [f"--with={_deco}"]
+        if ORIGIN_RUN_ID:
+            cmd += ["--clone-run-id", ORIGIN_RUN_ID]
+        cmd += [
             "step", step_name,
             "--run-id", run_id,
             "--task-id", task_id,
@@ -113,8 +137,6 @@ _HELPERS = textwrap.dedent('''\
         ]
         for _tag in TAGS:
             cmd += ["--tag", _tag]
-        for _deco in WITH_DECORATORS:
-            cmd += [f"--with={_deco}"]
         if NAMESPACE:
             cmd += ["--namespace", NAMESPACE]
         if split_index is not None:
@@ -244,6 +266,7 @@ def _build_header(
         "import os",
         "import subprocess",
         "import sys",
+        "import threading",
         "import uuid",
         "from typing import Any",
         "",
@@ -271,6 +294,7 @@ def _build_header(
         "NAMESPACE: str | None = %r" % spec.namespace,
         "SCHEDULE_CRON: str | None = %r" % spec.schedule_cron,
         "WITH_DECORATORS: list[str] = %r" % list(cfg.with_decorators),
+        "ORIGIN_RUN_ID: str | None = %r" % cfg.origin_run_id,
         "STEP_CMD_TEMPLATES: dict[str, tuple[str, ...]] = %r" % dict(cmd_templates or {}),
     ]
     return "\n".join(lines)
@@ -449,6 +473,10 @@ def _start_init_lines(spec: FlowSpec) -> list[str]:
         _INDENT + '"--datastore", DATASTORE_TYPE,',
         _INDENT + '"--metadata", METADATA_TYPE,',
         _INDENT + '"--no-pylint",',
+        "]",
+        "if ORIGIN_RUN_ID:",
+        _INDENT + 'init_cmd += ["--clone-run-id", ORIGIN_RUN_ID]',
+        "init_cmd += [",
         _INDENT + '"init",',
         _INDENT + '"--run-id", run_id,',
         _INDENT + '"--task-id", param_task_id,',

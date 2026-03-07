@@ -50,6 +50,7 @@ class PrefectFlow:
         flow_file: str | None = None,
         workflow_timeout: int | None = None,
         with_decorators: list[str] | None = None,
+        origin_run_id: str | None = None,
     ) -> None:
         self._graph = graph
         self._flow = flow
@@ -86,6 +87,7 @@ class PrefectFlow:
             max_workers=max_workers,
             with_decorators=tuple(with_decorators or []),
             workflow_timeout=workflow_timeout,
+            origin_run_id=origin_run_id,
         )
 
     def compile(self) -> str:
@@ -143,8 +145,8 @@ class PrefectFlow:
                 task.user_code_retries = max_retry_token
                 task.tags = list(spec.tags)
                 task.ubf_context = None
-                task.clone_run_id = None
-                task.is_cloned = False
+                task.clone_run_id = self._cfg.origin_run_id
+                task.is_cloned = self._cfg.origin_run_id is not None
                 task.clone_origin = None
 
                 for deco in task.decos:

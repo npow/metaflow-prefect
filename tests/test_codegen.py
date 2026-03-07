@@ -228,6 +228,7 @@ class TestGeneratePrefectFileSimple:
         assert "CODE_PACKAGE_URL" in src
         assert "CODE_PACKAGE_SHA" in src
         assert "CODE_PACKAGE_METADATA" in src
+        assert "ORIGIN_RUN_ID" in src
 
     def test_thread_pool_task_runner_imported(self, src: str) -> None:
         assert "ThreadPoolTaskRunner" in src

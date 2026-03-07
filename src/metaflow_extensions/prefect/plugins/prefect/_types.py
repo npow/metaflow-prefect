@@ -57,6 +57,21 @@ class ParameterSpec:
 
 
 @dataclass(frozen=True)
+class TriggerSpec:
+    """A custom-event trigger from @trigger(event=...)."""
+
+    event_name: str
+    parameter_map: tuple[tuple[str, str], ...] = ()  # (flow_param, event_field) pairs
+
+
+@dataclass(frozen=True)
+class TriggerOnFinishSpec:
+    """A flow-completion trigger from @trigger_on_finish(flow=...)."""
+
+    flow_name: str  # Prefect flow name to watch for completion
+
+
+@dataclass(frozen=True)
 class FlowSpec:
     """Fully-analysed description of a Metaflow flow, ready for code generation."""
 
@@ -68,6 +83,8 @@ class FlowSpec:
     tags: tuple[str, ...] = field(default_factory=tuple)
     namespace: str | None = None
     project_name: str | None = None    # from @project(name=...) if present
+    triggers: tuple[TriggerSpec, ...] = ()           # from @trigger
+    trigger_on_finishes: tuple[TriggerOnFinishSpec, ...] = ()  # from @trigger_on_finish
 
 
 @dataclass(frozen=True)
@@ -88,3 +105,4 @@ class PrefectFlowConfig:
     max_workers: int = 10
     with_decorators: tuple[str, ...] = ()  # extra --with=<deco> injected on every step
     workflow_timeout: int | None = None    # from --workflow-timeout (seconds)
+    origin_run_id: str | None = None       # from --clone-run-id (resume support)
