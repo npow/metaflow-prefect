@@ -21,10 +21,7 @@ from metaflow_extensions.prefect.plugins.prefect._types import (
     TriggerOnFinishSpec,
     TriggerSpec,
 )
-from metaflow_extensions.prefect.plugins.prefect.exception import (
-    NotSupportedException,
-    PrefectException,
-)
+from metaflow_extensions.prefect.plugins.prefect.exception import NotSupportedException
 
 if TYPE_CHECKING:
     # Only used for type-checker hints; not imported at runtime to avoid
@@ -47,8 +44,7 @@ def analyze_graph(
 
     Raises:
         NotSupportedException: For graph features not yet handled by this integration.
-        PrefectException: For configuration errors (e.g. missing parameter defaults).
-    """
+"""
     _validate(graph, flow)
 
     steps = _topological_order(graph)
@@ -114,10 +110,7 @@ def _validate(graph: Any, flow: Any) -> None:
     # @trigger and @trigger_on_finish are extracted and wired as Prefect automations
     # during deployment — no validation needed here.
 
-    try:
-        decos = flow._flow_decorators.get("exit_hook")
-    except Exception:
-        decos = None
+    decos = getattr(flow._flow_decorators, "get", lambda *_: None)("exit_hook")
     if decos:
         raise NotSupportedException(
             "@exit_hook is not supported with Prefect deployments."
@@ -180,22 +173,23 @@ def _step_resources(node: Any) -> tuple[int | None, int | None, int | None]:
     return (None, None, None)
 
 
+def _join_closes(graph: Any, node: Any, opener_type: str) -> bool:
+    """True when *node* is a join step whose opening split is of *opener_type*."""
+    return (
+        node.type == "join"
+        and bool(node.split_parents)
+        and graph[node.split_parents[-1]].type == opener_type
+    )
+
+
 def _is_foreach_join(graph: Any, node: Any) -> bool:
     """True when *node* is a join step that closes a foreach."""
-    if node.type != "join":
-        return False
-    if not node.split_parents:
-        return False
-    return graph[node.split_parents[-1]].type == "foreach"
+    return _join_closes(graph, node, "foreach")
 
 
 def _is_split_join(graph: Any, node: Any) -> bool:
     """True when *node* is a join step that closes a static split."""
-    if node.type != "join":
-        return False
-    if not node.split_parents:
-        return False
-    return graph[node.split_parents[-1]].type == "split"
+    return _join_closes(graph, node, "split")
 
 
 def _topological_order(graph: Any) -> list[StepSpec]:

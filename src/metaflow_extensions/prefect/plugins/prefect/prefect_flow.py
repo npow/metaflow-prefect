@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from dataclasses import replace
 from typing import Any
 
 from metaflow.util import get_username
@@ -72,15 +73,9 @@ class PrefectFlow:
             code_package_url=code_package_url or "",
             code_package_sha=code_package_sha or "",
             code_package_metadata=code_package_metadata or "",
-            environment_type=str(env_type) if isinstance(env_type, str) else "local",
-            event_logger_type=(
-                str(event_logger_type)
-                if isinstance(event_logger_type, str)
-                else "nullSidecarLogger"
-            ),
-            monitor_type=(
-                str(monitor_type) if isinstance(monitor_type, str) else "nullSidecarMonitor"
-            ),
+            environment_type=env_type if isinstance(env_type, str) else "local",
+            event_logger_type=event_logger_type if isinstance(event_logger_type, str) else "nullSidecarLogger",
+            monitor_type=monitor_type if isinstance(monitor_type, str) else "nullSidecarMonitor",
             datastore_root=str(datastore_root) if datastore_root is not None else None,
             username=username or get_username(),
             max_workers=max_workers,
@@ -91,8 +86,6 @@ class PrefectFlow:
 
     def compile(self) -> str:
         """Return the full Python source of the generated Prefect flow file."""
-        from dataclasses import replace
-
         spec: FlowSpec = analyze_graph(self._graph, self._flow)
         # Overlay CLI-supplied tags/namespace (they may differ from flow decorators).
         # Use dataclasses.replace so all other fields (triggers, etc.) are preserved.
@@ -148,13 +141,13 @@ class PrefectFlow:
                 task.clone_origin = None
 
                 for deco in task.decos:
-                    if hasattr(deco, "package_metadata") and not getattr(
-                        deco, "package_metadata", None
-                    ):
+                    # Only fill in package fields on decorators that already declare them
+                    # (i.e., decorators that support code packaging), and only when unset.
+                    if hasattr(deco, "package_metadata") and not deco.package_metadata:
                         deco.package_metadata = self._cfg.code_package_metadata
-                    if hasattr(deco, "package_sha") and not getattr(deco, "package_sha", None):
+                    if hasattr(deco, "package_sha") and not deco.package_sha:
                         deco.package_sha = self._cfg.code_package_sha
-                    if hasattr(deco, "package_url") and not getattr(deco, "package_url", None):
+                    if hasattr(deco, "package_url") and not deco.package_url:
                         deco.package_url = self._cfg.code_package_url
 
                 args = RuntimeCLIArgs(task)

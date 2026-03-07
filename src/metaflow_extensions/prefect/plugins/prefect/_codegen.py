@@ -7,10 +7,10 @@ Prefect flow.
 
 Design
 ------
-Code generation is split into four concerns, each returning a plain string:
+Code generation is split into four sections:
 
 1. ``_build_header``  — compile-time constants (FLOW_NAME, DATASTORE_TYPE, …)
-2. ``_HELPERS``       — runtime helper functions, embedded verbatim
+2. ``_HELPERS``       — static string of runtime helper functions, pasted verbatim
 3. ``_build_task``    — one ``@task`` function per Metaflow step
 4. ``_build_flow``    — the top-level ``@flow`` function that wires steps together
 
@@ -36,6 +36,9 @@ from metaflow_extensions.prefect.plugins.prefect._types import (
 )
 
 _INDENT = "    "
+
+# Loop-index variable names for nested foreach levels (depth 0..7).
+_IDX = ["_i", "_j", "_k", "_l", "_m", "_n", "_o", "_p"]
 
 # ---------------------------------------------------------------------------
 # Static helper code — pasted verbatim into every generated file.
@@ -239,7 +242,7 @@ def generate_prefect_file(
         _HELPERS,
     ]
     for step in spec.steps:
-        sections.append(_build_task(step, spec, cfg))
+        sections.append(_build_task(step, spec))
     sections.append(_build_flow(spec, cfg))
     main_guard = "if __name__ == '__main__':\n" + _INDENT + "%s()" % _python_name(spec.name)
     sections.append(main_guard)
@@ -300,7 +303,7 @@ def _build_header(
 # ---------------------------------------------------------------------------
 
 
-def _build_task(step: StepSpec, spec: FlowSpec, cfg: PrefectFlowConfig) -> str:
+def _build_task(step: StepSpec, spec: FlowSpec) -> str:
     """Return the full source of the @task function for one Metaflow step."""
     body = _task_body_lines(step, spec)
     indented_body = [_INDENT + line if line else "" for line in body]
@@ -438,8 +441,8 @@ def _input_paths_line(step: StepSpec, spec: FlowSpec) -> str:
             for p in step.in_funcs
         )
         return 'input_paths: str = ",".join([%s])' % path_exprs
-    parent = step.in_funcs[0] if step.in_funcs else "start"
-    return 'input_paths: str = f"{run_id}/%s/{prev_task_id}"' % parent
+    # Every non-start step has at least one predecessor — step.in_funcs is never empty here.
+    return 'input_paths: str = f"{run_id}/%s/{prev_task_id}"' % step.in_funcs[0]
 
 
 def _ctx_inject_lines() -> list[str]:
@@ -578,9 +581,9 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
 
         if step.name in nested_skip:
             # Handled inside a chain block; task_id_vars already populated.
-            pass
+            continue
 
-        elif is_start and step.node_type == NodeType.FOREACH:
+        if is_start and step.node_type == NodeType.FOREACH:
             lines.append(
                 "%s_pair: tuple[str, int] = %s(run_id, parameters)"
                 % (tid_var, _task_fn(step.name))
@@ -719,7 +722,6 @@ def _chain_wiring_lines(
         The step name whose task IDs populate ``result_var`` — passed as
         ``parent_step`` to the join function.
     """
-    _IDX = ["_i", "_j", "_k", "_l", "_m", "_n", "_o", "_p"]
     idx = _IDX[depth] if depth < len(_IDX) else "_idx_%d" % depth
 
     _foreach_name, body_name, join_name = chain[0]

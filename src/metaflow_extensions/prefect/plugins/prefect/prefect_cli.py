@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import tempfile
+from collections.abc import Callable
 
 from metaflow._vendor import click
 from metaflow.exception import MetaflowException
@@ -256,7 +257,7 @@ def create(
             work_pool=work_pool,
             paused=paused,
             tags=list(tags),
-            obj=obj,
+            echo=obj.echo,  # type: ignore[attr-defined]
             flow_spec=mf_spec,
         )
     )
@@ -310,7 +311,7 @@ def trigger(
             deployment_name=name,
             params=params,
             deployer_attribute_file=deployer_attribute_file,
-            obj=obj,
+            echo=obj.echo,  # type: ignore[attr-defined]
         )
     )
 
@@ -330,7 +331,7 @@ def _compile_and_run_locally(
     origin_run_id: str | None = None,
 ) -> None:
     """Compile the flow to a temp file, execute it in-process, then delete it."""
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w", dir=os.getcwd()) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, dir=os.getcwd()) as tmp:
         tmp_path = tmp.name
     try:
         _make_flow_and_write(
@@ -344,11 +345,11 @@ def _compile_and_run_locally(
 
 def _exec_flow_file(path: str, flow_name: str) -> None:
     """Load a generated Prefect flow file and call its @flow entry point."""
-    spec = importlib.util.spec_from_file_location("_mf_prefect_flow", path)
-    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    mod_spec = importlib.util.spec_from_file_location("_mf_prefect_flow", path)
+    mod = importlib.util.module_from_spec(mod_spec)  # type: ignore[arg-type]
     # Register in sys.modules so Prefect's deployment introspection can find it.
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    sys.modules[mod_spec.name] = mod
+    mod_spec.loader.exec_module(mod)  # type: ignore[union-attr]
     getattr(mod, _python_name(flow_name))()
 
 
@@ -404,7 +405,7 @@ async def _register_deployment(
     work_pool: str | None,
     paused: bool,
     tags: list[str],
-    obj: object,
+    echo: Callable[..., None],
     flow_spec: FlowSpec,
 ) -> None:
     try:
@@ -439,9 +440,9 @@ async def _register_deployment(
     # Always sync automations so stale ones are cleaned up even when all
     # @trigger/@trigger_on_finish decorators have been removed from the flow.
     async with get_client() as client:
-        await _sync_automations(client, deployment_id, name, flow_spec, obj)
+        await _sync_automations(client, deployment_id, name, flow_spec, echo)
 
-    obj.echo(  # type: ignore[attr-defined]
+    echo(
         "Deployment *{name}* registered with id *{id}*.".format(
             name=name, id=deployment_id
         ),
@@ -454,7 +455,7 @@ async def _sync_automations(
     deployment_id: object,
     deployment_name: str,
     spec: FlowSpec,
-    obj: object,
+    echo: Callable[..., None],
 ) -> None:
     """Upsert Prefect automations for @trigger and @trigger_on_finish decorators.
 
@@ -508,14 +509,10 @@ async def _sync_automations(
         existing = await client.read_automations_by_name(auto_name)  # type: ignore[attr-defined]
         if existing:
             await client.update_automation(existing[0].id, automation)  # type: ignore[attr-defined]
-            obj.echo(  # type: ignore[attr-defined]
-                "Automation *{name}* updated.".format(name=auto_name), bold=False
-            )
+            echo("Automation *{name}* updated.".format(name=auto_name), bold=False)
         else:
             await client.create_automation(automation)  # type: ignore[attr-defined]
-            obj.echo(  # type: ignore[attr-defined]
-                "Automation *{name}* created.".format(name=auto_name), bold=False
-            )
+            echo("Automation *{name}* created.".format(name=auto_name), bold=False)
 
     # Clean up stale automations from previous deploys of this deployment
     # (e.g. @trigger was removed from the flow).
@@ -525,16 +522,14 @@ async def _sync_automations(
         for auto in all_automations:
             if auto.name.startswith(owned_prefix) and auto.name not in desired_names:
                 await client.delete_automation(auto.id)  # type: ignore[attr-defined]
-                obj.echo(  # type: ignore[attr-defined]
+                echo(
                     "Automation *{name}* deleted (no longer referenced by flow).".format(
                         name=auto.name
                     ),
                     bold=False,
                 )
     except Exception as exc:
-        obj.echo(  # type: ignore[attr-defined]
-            "Warning: could not check for stale automations: %s" % exc, bold=False
-        )
+        echo("Warning: could not check for stale automations: %s" % exc, bold=False)
 
 
 async def _trigger_deployment(
@@ -542,7 +537,7 @@ async def _trigger_deployment(
     deployment_name: str,
     params: dict[str, str],
     deployer_attribute_file: str | None,
-    obj: object,
+    echo: Callable[..., None],
 ) -> None:
     """Trigger a Prefect deployment run and optionally write run info to a file."""
     try:
@@ -583,12 +578,10 @@ async def _trigger_deployment(
                 f,
             )
 
-    obj.echo(  # type: ignore[attr-defined]
+    echo(
         "Triggered Prefect flow run *{run_id}* (pathspec: *{pathspec}*).".format(
             run_id=flow_run.id, pathspec=pathspec
         ),
         bold=True,
     )
-
-
 
