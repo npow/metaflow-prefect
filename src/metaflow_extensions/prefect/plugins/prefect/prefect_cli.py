@@ -278,6 +278,8 @@ def create(
     flow_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     flow_file_path = os.path.join(flow_dir, flow_file_name)
 
+    mf_spec = analyze_graph(obj.graph, obj.flow)  # type: ignore[attr-defined]
+
     _make_flow_and_write(obj, flow_file_path, tags, user_namespace, max_workers, with_decorators, workflow_timeout)
     spec = importlib.util.spec_from_file_location("_mf_prefect_flow", flow_file_path)
     mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
@@ -287,14 +289,11 @@ def create(
     flow_fn_name = _python_name(obj.flow.name)  # type: ignore[attr-defined]
     prefect_flow_fn = getattr(mod, flow_fn_name)
 
-    schedule_cron = _get_schedule_cron(obj.flow)  # type: ignore[attr-defined]
-    mf_spec = analyze_graph(obj.graph, obj.flow)  # type: ignore[attr-defined]
-
     asyncio.run(
         _register_deployment(
             prefect_flow_fn,
             name=name,
-            cron=schedule_cron,
+            cron=mf_spec.schedule_cron,
             work_pool=work_pool,
             paused=paused,
             tags=list(tags),
@@ -419,7 +418,7 @@ async def _register_deployment(
     paused: bool,
     tags: list[str],
     obj: object,
-    flow_spec: FlowSpec | None = None,
+    flow_spec: FlowSpec,
 ) -> None:
     try:
         from prefect.client.orchestration import get_client
@@ -450,7 +449,7 @@ async def _register_deployment(
     apply_result = deployment.apply()
     deployment_id = await apply_result if asyncio.iscoroutine(apply_result) else apply_result
 
-    if flow_spec and (flow_spec.triggers or flow_spec.trigger_on_finishes):
+    if flow_spec.triggers or flow_spec.trigger_on_finishes:
         async with get_client() as client:
             await _sync_automations(client, deployment_id, name, flow_spec, obj)
 
@@ -515,6 +514,8 @@ async def _sync_automations(
             enabled=True,
         )))
 
+    desired_names = {auto_name for auto_name, _ in desired}
+
     for auto_name, automation in desired:
         existing = await client.read_automations_by_name(auto_name)  # type: ignore[attr-defined]
         if existing:
@@ -527,6 +528,25 @@ async def _sync_automations(
             obj.echo(  # type: ignore[attr-defined]
                 "Automation *{name}* created.".format(name=auto_name), bold=False
             )
+
+    # Clean up stale automations from previous deploys of this deployment
+    # (e.g. @trigger was removed from the flow).
+    owned_prefix = "metaflow/%s:" % deployment_name
+    try:
+        all_automations = await client.read_automations()  # type: ignore[attr-defined]
+        for auto in all_automations:
+            if auto.name.startswith(owned_prefix) and auto.name not in desired_names:
+                await client.delete_automation(auto.id)  # type: ignore[attr-defined]
+                obj.echo(  # type: ignore[attr-defined]
+                    "Automation *{name}* deleted (no longer referenced by flow).".format(
+                        name=auto.name
+                    ),
+                    bold=False,
+                )
+    except Exception as exc:
+        obj.echo(  # type: ignore[attr-defined]
+            "Warning: could not check for stale automations: %s" % exc, bold=False
+        )
 
 
 async def _trigger_deployment(
@@ -609,22 +629,6 @@ def _resolve_name(obj: object) -> str:
             "Flow name '%s' contains characters not allowed in a Prefect flow name." % name
         )
     return name
-
-
-def _get_schedule_cron(flow: object) -> str | None:
-    schedules = flow._flow_decorators.get("schedule")  # type: ignore[attr-defined]
-    if not schedules:
-        return None
-    s = schedules[0]
-    if s.attributes.get("cron"):
-        return s.attributes["cron"]
-    if s.attributes.get("weekly"):
-        return "0 0 * * 0"
-    if s.attributes.get("hourly"):
-        return "0 * * * *"
-    if s.attributes.get("daily"):
-        return "0 0 * * *"
-    return None
 
 
 def _python_name(flow_name: str) -> str:

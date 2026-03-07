@@ -7,6 +7,7 @@ that ``_codegen.py`` later turns into Python source.
 
 from __future__ import annotations
 
+import warnings
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
@@ -79,8 +80,6 @@ def analyze_graph(
 
 def _validate(graph: Any, flow: Any) -> None:
     """Raise NotSupportedException for features incompatible with Prefect."""
-    import warnings
-
     # Step-level checks
     for node in graph:
         if node.parallel_foreach:
@@ -345,6 +344,12 @@ def _extract_triggers(flow: Any) -> list[TriggerSpec]:
             continue
         name = t.get("name")
         if not name or not isinstance(name, str):
+            warnings.warn(
+                "@trigger entry has a non-string or deploy-time event name %r — "
+                "skipping this trigger.  Evaluate the event name before deploying." % (name,),
+                UserWarning,
+                stacklevel=2,
+            )
             continue
         params: dict[str, str] = t.get("parameters") or {}
         param_map = tuple(sorted(params.items())) if isinstance(params, dict) else ()
