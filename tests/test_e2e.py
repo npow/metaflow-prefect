@@ -263,12 +263,10 @@ class TestPrefectDeployment:
         )
         assert r.returncode == 0, f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
 
-        # Trigger with custom parameters
-        flow_run_id = await _trigger_and_wait(
-            "ParamFlow", "e2e-params",
-            parameters={"message": "hi", "count": 2},
-        )
+        # Trigger with default parameters (no override).
+        flow_run_id = await _trigger_and_wait("ParamFlow", "e2e-params")
 
         mf_run = _mf_run_by_id("ParamFlow", f"prefect-{flow_run_id}")
         assert mf_run.successful
-        assert mf_run["start"].task.data.output == "hihi"
+        # default: message="hello", count=3 → output="hellohellohello"
+        assert mf_run["start"].task.data.output == "hellohellohello"
