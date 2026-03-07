@@ -32,6 +32,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      # Ensure the test process and all Metaflow subprocesses share the same
+      # local datastore/metadata root.  Without this the test process defaults
+      # to CWD/.metaflow/ while generated flow code forces subprocesses to ~/
+      - name: Pin Metaflow local datastore root
+        run: echo "METAFLOW_DATASTORE_SYSROOT_LOCAL=$HOME" >> "$GITHUB_ENV"
+
       # -----------------------------------------------------------------------
       # Prefect server
       # -----------------------------------------------------------------------

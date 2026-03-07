@@ -415,8 +415,11 @@ def _input_paths_line(step: StepSpec, spec: FlowSpec) -> str:
             'f"{run_id}/{parent_step}/{tid}" for tid in task_ids)'
         )
     if step.is_split_join:
+        # Use single curly braces so the generated f-string evaluates run_id and
+        # parent_task_ids at runtime.  Note: %% formatting does NOT treat {{ as an
+        # escape (unlike .format()), so we must use literal single-brace expressions.
         path_exprs = ", ".join(
-            'f"{{run_id}}/%s/{{parent_task_ids[%r]}}"' % (p, p)
+            'f"{run_id}/%s/{parent_task_ids[\'%s\']}"' % (p, p)
             for p in step.in_funcs
         )
         return 'input_paths: str = ",".join([%s])' % path_exprs
