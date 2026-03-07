@@ -69,6 +69,22 @@ _HELPERS = textwrap.dedent('''\
             ) from _e
 
 
+    def _read_condition_branch(run_id: str, step_name: str, task_id: str) -> str:
+        """Read the condition branch taken from the Metaflow datastore after step completes."""
+        try:
+            from metaflow.datastore import FlowDataStore
+            from metaflow.plugins import DATASTORES
+            _impl = next(d for d in DATASTORES if d.TYPE == DATASTORE_TYPE)
+            _root = _impl.get_datastore_root_from_config(lambda *a: None)
+            _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
+            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
+            return str(_tds["_transition"])
+        except Exception as _e:
+            raise RuntimeError(
+                f"Could not read condition branch for {step_name}/{task_id}: {_e}"
+            ) from _e
+
+
     def _run_cmd(cmd: list[str], extra_env: dict[str, str] | None = None) -> None:
         """Execute cmd as a subprocess, streaming stdout/stderr to the Prefect logger."""
         env = os.environ.copy()
@@ -355,6 +371,8 @@ def _task_signature(step: StepSpec, foreach_body: set[str]) -> str:
         return "run_id: str, parent_step: str, task_ids: list[str]"
     if step.is_split_join:
         return "run_id: str, parent_task_ids: dict[str, str]"
+    if step.condition_switch:
+        return "run_id: str, branch_name: str, branch_task_id: str"
     if step.name in foreach_body:
         return "run_id: str, prev_task_id: str, split_index: int = 0"
     return "run_id: str, prev_task_id: str"
@@ -364,6 +382,8 @@ def _task_return_type(step: StepSpec) -> str:
     """Return the return type annotation string for the @task function."""
     if step.node_type == NodeType.FOREACH:
         return "tuple[str, int]"
+    if step.node_type == NodeType.SPLIT_SWITCH:
+        return "tuple[str, str]"
     return "str"
 
 
@@ -419,6 +439,9 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
     if step.node_type == NodeType.FOREACH:
         lines.append("num_splits: int = _read_foreach_num_splits(run_id, %r, task_id)" % step.name)
         lines.append("return task_id, num_splits")
+    elif step.node_type == NodeType.SPLIT_SWITCH:
+        lines.append("branch_taken: str = _read_condition_branch(run_id, %r, task_id)" % step.name)
+        lines.append("return task_id, branch_taken")
     else:
         lines.append("return task_id")
 
@@ -436,6 +459,8 @@ def _input_paths_line(step: StepSpec) -> str:
             'input_paths: str = ",".join('
             'f"{run_id}/{parent_step}/{tid}" for tid in task_ids)'
         )
+    if step.condition_switch:
+        return 'input_paths: str = f"{run_id}/{branch_name}/{branch_task_id}"'
     if step.is_split_join:
         # Use single curly braces so the generated f-string evaluates run_id and
         # parent_task_ids at runtime.  Note: %% formatting does NOT treat {{ as an
@@ -561,6 +586,15 @@ def _flow_body_lines(spec: FlowSpec) -> list[str]:
     return lines
 
 
+def _condition_groups(spec: FlowSpec) -> dict[str, list[str]]:
+    """Return {split_switch_name: [branch_step_names]} for every split-switch."""
+    return {
+        step.name: list(step.out_funcs)
+        for step in spec.steps
+        if step.node_type == NodeType.SPLIT_SWITCH
+    }
+
+
 def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
     """Return lines that call each @task in topological order."""
     lines: list[str] = []
@@ -570,6 +604,7 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
 
     # Build chains for all outermost foreach steps (supports arbitrary nesting depth).
     chains = _foreach_chains(spec)
+    condition_groups = _condition_groups(spec)
 
     # Steps whose code is generated inside chain blocks — skip in main iteration.
     nested_skip: set[str] = set()
@@ -579,6 +614,10 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
             nested_skip.add(join_name)
         nested_skip.discard(outer)         # outermost foreach: called at top level
         nested_skip.discard(chain[0][2])   # outermost join: handled by the is_foreach_join branch
+
+    # Branch steps of condition splits are emitted inside if/elif blocks.
+    for branch_list in condition_groups.values():
+        nested_skip.update(branch_list)
 
     for step in spec.steps:
         tid_var = "_tid_%s" % step.name
@@ -601,6 +640,27 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
             lines += chain_lines
             task_id_vars[result_step] = result_var
             task_id_vars[step.name] = tid_var
+
+        elif is_start and step.node_type == NodeType.SPLIT_SWITCH:
+            branches = condition_groups[step.name]
+            lines.append(
+                "%s_pair: tuple[str, str] = %s(run_id, parameters)"
+                % (tid_var, _task_fn(step.name))
+            )
+            lines.append("%s: str = %s_pair[0]" % (tid_var, tid_var))
+            lines.append("%s_branch: str = %s_pair[1]" % (tid_var, tid_var))
+            task_id_vars[step.name] = tid_var
+            for i, branch in enumerate(branches):
+                kw = "if" if i == 0 else "elif"
+                lines.append("%s %s_branch == %r:" % (kw, tid_var, branch))
+                lines.append(
+                    _INDENT + "%s_taken: str = %s(run_id, %s)"
+                    % (tid_var, _task_fn(branch), tid_var)
+                )
+            lines.append("else:")
+            lines.append(
+                _INDENT + 'raise RuntimeError(f"Unexpected condition branch: {%s_branch}")' % tid_var
+            )
 
         elif is_start:
             lines.append(
@@ -627,6 +687,16 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
             )
             task_id_vars[step.name] = tid_var
 
+        elif step.condition_switch:
+            switch_name = step.condition_switch
+            branch_var = "_tid_%s_branch" % switch_name
+            taken_var = "_tid_%s_taken" % switch_name
+            lines.append(
+                "%s: str = %s(run_id, %s, %s)"
+                % (tid_var, _task_fn(step.name), branch_var, taken_var)
+            )
+            task_id_vars[step.name] = tid_var
+
         elif step.node_type == NodeType.FOREACH:
             parent_var = task_id_vars[step.in_funcs[0]]
             lines.append(
@@ -641,6 +711,28 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
             lines += chain_lines
             task_id_vars[result_step] = result_var
             task_id_vars[step.name] = tid_var
+
+        elif step.node_type == NodeType.SPLIT_SWITCH:
+            parent_var = task_id_vars[step.in_funcs[0]]
+            branches = condition_groups[step.name]
+            lines.append(
+                "%s_pair: tuple[str, str] = %s(run_id, %s)"
+                % (tid_var, _task_fn(step.name), parent_var)
+            )
+            lines.append("%s: str = %s_pair[0]" % (tid_var, tid_var))
+            lines.append("%s_branch: str = %s_pair[1]" % (tid_var, tid_var))
+            task_id_vars[step.name] = tid_var
+            for i, branch in enumerate(branches):
+                kw = "if" if i == 0 else "elif"
+                lines.append("%s %s_branch == %r:" % (kw, tid_var, branch))
+                lines.append(
+                    _INDENT + "%s_taken: str = %s(run_id, %s)"
+                    % (tid_var, _task_fn(branch), tid_var)
+                )
+            lines.append("else:")
+            lines.append(
+                _INDENT + 'raise RuntimeError(f"Unexpected condition branch: {%s_branch}")' % tid_var
+            )
 
         else:
             # Linear, split branch, or end step.

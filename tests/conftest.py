@@ -144,6 +144,12 @@ def mid_foreach_flow_graph() -> tuple[Any, Any]:
     return _load_flow_graph(str(FLOWS_DIR / "mid_foreach_flow.py"))
 
 
+@pytest.fixture(scope="session")
+def condition_flow_graph() -> tuple[Any, Any]:
+    """(graph, flow) for ConditionFlow (conditional split-switch branching)."""
+    return _load_flow_graph(str(FLOWS_DIR / "condition_flow.py"))
+
+
 # ---------------------------------------------------------------------------
 # Mock Metaflow infrastructure objects
 # ---------------------------------------------------------------------------

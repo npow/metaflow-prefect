@@ -465,12 +465,6 @@ class TestDecoratorExtraction:
 class TestValidationAdversarial:
     """Edge-case and adversarial validation tests targeting uncovered branches."""
 
-    def test_condition_raises(self) -> None:
-        """@condition decorator raises NotSupportedException."""
-        graph, flow = _make_mock_graph(deco_names=["condition"])
-        with pytest.raises(NotSupportedException, match="@condition"):
-            analyze_graph(graph, flow)
-
     def test_unknown_node_type_falls_back_to_linear(self) -> None:
         """An unrecognised node type string falls back to NodeType.LINEAR without error."""
         from metaflow_extensions.prefect.plugins.prefect._graph import _topological_order
@@ -605,3 +599,58 @@ class TestValidationAdversarial:
         assert any("missing flow name" in str(w.message) for w in caught)
         assert len(spec.trigger_on_finishes) == 1
         assert spec.trigger_on_finishes[0].flow_name == "RealFlow"
+
+
+class TestAnalyzeGraphCondition:
+    """analyze_graph with the conditional (split-switch) flow."""
+
+    def test_all_steps_present(self, condition_flow_graph: tuple[Any, Any]) -> None:
+        graph, flow = condition_flow_graph
+        spec = analyze_graph(graph, flow)
+        names = {s.name for s in spec.steps}
+        assert names == {"start", "high_branch", "low_branch", "join", "end"}
+
+    def test_start_node_type_is_split_switch(self, condition_flow_graph: tuple[Any, Any]) -> None:
+        """The start step has type SPLIT_SWITCH when using @condition."""
+        graph, flow = condition_flow_graph
+        spec = analyze_graph(graph, flow)
+        start = next(s for s in spec.steps if s.name == "start")
+        assert start.node_type == NodeType.SPLIT_SWITCH
+
+    def test_start_out_funcs_are_branches(self, condition_flow_graph: tuple[Any, Any]) -> None:
+        """The split-switch step's out_funcs are exactly the two branch steps."""
+        graph, flow = condition_flow_graph
+        spec = analyze_graph(graph, flow)
+        start = next(s for s in spec.steps if s.name == "start")
+        assert set(start.out_funcs) == {"high_branch", "low_branch"}
+
+    def test_join_is_condition_merge(self, condition_flow_graph: tuple[Any, Any]) -> None:
+        """The merge step has condition_switch pointing at the split-switch step."""
+        graph, flow = condition_flow_graph
+        spec = analyze_graph(graph, flow)
+        join = next(s for s in spec.steps if s.name == "join")
+        assert join.condition_switch == "start"
+        assert join.is_split_join is False
+        assert join.is_foreach_join is False
+
+    def test_join_condition_switch_points_to_start(self, condition_flow_graph: tuple[Any, Any]) -> None:
+        """The condition merge's condition_switch is the split-switch step name."""
+        graph, flow = condition_flow_graph
+        spec = analyze_graph(graph, flow)
+        join = next(s for s in spec.steps if s.name == "join")
+        assert join.condition_switch == "start"
+
+    def test_branch_steps_are_linear(self, condition_flow_graph: tuple[Any, Any]) -> None:
+        """Branch steps have LINEAR node type (not split or join)."""
+        graph, flow = condition_flow_graph
+        spec = analyze_graph(graph, flow)
+        for branch_name in ("high_branch", "low_branch"):
+            branch = next(s for s in spec.steps if s.name == branch_name)
+            assert branch.node_type == NodeType.LINEAR
+
+    def test_condition_does_not_raise(self, condition_flow_graph: tuple[Any, Any]) -> None:
+        """@condition flows no longer raise NotSupportedException."""
+        graph, flow = condition_flow_graph
+        # Should not raise — @condition is now supported.
+        spec = analyze_graph(graph, flow)
+        assert spec is not None

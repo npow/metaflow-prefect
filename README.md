@@ -73,12 +73,26 @@ class SimpleFlow(FlowSpec):
     @step
     def end(self): pass
 
-# Split/join (branch)
+# Split/join (static branch)
 class BranchFlow(FlowSpec):
     @step
     def start(self):
         self.next(self.branch_a, self.branch_b)
     ...
+
+# Conditional (dynamic branch — only one path runs at runtime)
+class ConditionalFlow(FlowSpec):
+    value = Parameter("value", default=42, type=int)
+    @step
+    def start(self):
+        self.route = "high" if self.value >= 50 else "low"
+        self.next({"high": self.high_branch, "low": self.low_branch}, condition="route")
+    @step
+    def high_branch(self): ...
+    @step
+    def low_branch(self): ...
+    @step
+    def join(self): ...
 
 # Foreach fan-out (body tasks run concurrently)
 class ForeachFlow(FlowSpec):
@@ -262,14 +276,13 @@ names and a one-liner to fetch each value:
 | `@trigger(event=...)` | Creates a Prefect automation that fires the deployment on the named event |
 | `@trigger_on_finish(flow=...)` | Creates a Prefect automation that fires the deployment when the upstream Prefect flow completes |
 
-Unsupported decorators (`@batch`, `@slurm`, `@condition`, `@exit_hook`, `@parallel`)
+Unsupported decorators (`@batch`, `@slurm`, `@exit_hook`, `@parallel`)
 raise a clear error at compile time.
 
 ## Limitations
 
 | Limitation | Detail |
 |---|---|
-| No `@condition` support | Metaflow's conditional branching (`@condition`) is not supported — it raises a compile-time error to prevent generating incorrect code. |
 | No `parallel_foreach` | `parallel_foreach=True` (Metaflow's MPI-style multi-node execution) requires `@batch` or `@kubernetes` backends and runs as a single distributed job, which has no Prefect equivalent. Raises an error at compile time. |
 | `@resources` tags are advisory | CPU/GPU/memory hints are added as Prefect task tags and are visible in the UI, but do not automatically allocate resources — configure matching resources on the work pool. |
 | `@trigger` event scope | `@trigger(event="foo")` watches for a Prefect event named `"foo"`. Metaflow's own event system is separate from Prefect's — emit events via Prefect's event API to use this trigger. |

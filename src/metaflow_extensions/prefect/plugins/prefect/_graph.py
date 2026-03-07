@@ -86,12 +86,6 @@ def _validate(graph: Any, flow: Any) -> None:
                 raise NotSupportedException(
                     f"Step *{node.name}* uses @slurm which is not supported with Prefect."
                 )
-            if deco.name == "condition":
-                raise NotSupportedException(
-                    f"Step *{node.name}* uses @condition which is not supported with Prefect. "
-                    "Conditional branching via @condition produces incorrect generated "
-                    "code and must be removed."
-                )
             if deco.name == "resources":
                 warnings.warn(
                     f"Step *{node.name}* uses @resources. Resource requirements are recorded as "
@@ -187,6 +181,25 @@ def _is_split_join(graph: Any, node: Any) -> bool:
     return _join_closes(graph, node, "split")
 
 
+def _find_condition_switch_name(graph: Any, node: Any) -> str | None:
+    """Return the split-switch step name if *node* merges branches from a conditional.
+
+    In Metaflow's split-switch, the merge step has type 'linear' (not 'join') and
+    split_parents is empty.  We detect it by checking whether all in_funcs share
+    exactly one common parent whose type is 'split-switch'.
+    """
+    if len(node.in_funcs) < 2:
+        return None
+    parent_sets = [set(graph[p].in_funcs) for p in node.in_funcs]
+    common_parents: set[str] = parent_sets[0].copy()
+    for s in parent_sets[1:]:
+        common_parents &= s
+    for p in common_parents:
+        if graph[p].type == "split-switch":
+            return p
+    return None
+
+
 def _topological_order(graph: Any) -> list[StepSpec]:
     """BFS from *start* yielding ``StepSpec`` objects in topological order."""
     visited: set[str] = set()
@@ -223,6 +236,7 @@ def _topological_order(graph: Any) -> list[StepSpec]:
             max_user_code_retries=_max_user_code_retries(node),
             is_foreach_join=_is_foreach_join(graph, node),
             is_split_join=_is_split_join(graph, node),
+            condition_switch=_find_condition_switch_name(graph, node),
             timeout_seconds=_step_timeout_seconds(node),
             retry_delay_seconds=_step_retry_delay_seconds(node),
             env_vars=_step_env_vars(node),

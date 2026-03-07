@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "metaflow-prefect"
-version = "0.3.5"
+version = "0.3.6"
 description = "Metaflow extension: deploy and run flows as Prefect deployments"
 readme = "README.md"
 license = "Apache-2.0"
@@ -31,9 +31,19 @@ packages = ["src/metaflow_extensions"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "--cov=src/metaflow_extensions/prefect/plugins/prefect --cov-report=term-missing --cov-report=xml --cov-report=html"
 markers = [
     "e2e: marks tests that run a real Prefect server and execute flows end-to-end",
 ]
+
+[tool.coverage.run]
+source = ["src/metaflow_extensions"]
+omit = ["*/mfextinit_*.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 80
 
 [tool.pyright]
 include = ["src"]
@@ -50,9 +60,13 @@ select = [
     "F",   # pyflakes (unused imports, undefined names)
     "I",   # isort (import ordering)
     "UP",  # pyupgrade (modernise syntax)
+    "B",   # flake8-bugbear (common bugs and design issues)
+    "C4",  # flake8-comprehensions (unnecessary collection literals)
 ]
 ignore = [
     "E501",  # line too long — long strings in codegen are intentional
+    "B008",  # do not perform function calls in default arguments
+    "B904",  # raise from None in except blocks
 ]
 
 [tool.ruff.lint.per-file-ignores]

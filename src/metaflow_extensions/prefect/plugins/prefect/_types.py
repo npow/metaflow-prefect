@@ -17,6 +17,7 @@ class NodeType(str, Enum):
     START = "start"
     LINEAR = "linear"
     SPLIT = "split"
+    SPLIT_SWITCH = "split-switch"
     JOIN = "join"
     FOREACH = "foreach"
     END = "end"
@@ -37,6 +38,7 @@ class StepSpec:
     max_user_code_retries: int = 0
     is_foreach_join: bool = False   # join that closes a foreach
     is_split_join: bool = False     # join that closes a static split
+    condition_switch: str | None = None  # name of the split-switch step this step merges; non-None → is a condition merge
     timeout_seconds: int | None = None        # from @timeout(seconds=N)
     retry_delay_seconds: int | None = None    # from @retry(minutes_between_retries=N)
     env_vars: tuple[tuple[str, str], ...] = ()  # from @environment(vars={...})

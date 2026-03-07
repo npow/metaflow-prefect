@@ -782,3 +782,88 @@ class TestMidForeachCodegen:
         fns = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
         for step in ("_step_start", "_step_foreach_mid", "_step_body", "_step_join", "_step_end"):
             assert step in fns, f"{step} missing from generated file"
+
+
+class TestConditionFlowCodegen:
+    """Generated code for a conditional (split-switch) flow."""
+
+    @pytest.fixture(scope="class")
+    def src(self, condition_flow_graph: tuple[Any, Any]) -> str:
+        graph, flow = condition_flow_graph
+        spec = analyze_graph(graph, flow)
+        return generate_prefect_file(spec, _make_cfg())
+
+    def test_is_valid_python(self, src: str) -> None:
+        _parse(src)
+
+    def test_all_task_functions_present(self, src: str) -> None:
+        tree = _parse(src)
+        fns = _fn_names_at_module_level(tree)
+        for name in (
+            "_step_start", "_step_high_branch", "_step_low_branch", "_step_join", "_step_end"
+        ):
+            assert name in fns, f"{name} missing from generated file"
+
+    def test_start_returns_tuple_str_str(self, src: str) -> None:
+        """The split-switch start step must return tuple[str, str]."""
+        tree = _parse(src)
+        fn = _find_fn(tree, "_step_start")
+        assert fn is not None
+        if fn.returns:
+            annotation = ast.unparse(fn.returns)
+            assert "tuple" in annotation.lower()
+            assert "str" in annotation
+
+    def test_condition_helper_present(self, src: str) -> None:
+        """_read_condition_branch helper is embedded in the generated file."""
+        assert "_read_condition_branch" in src
+
+    def test_condition_helper_reads_transition(self, src: str) -> None:
+        """The helper reads the '_transition' artifact from the datastore."""
+        assert "_transition" in src
+
+    def test_join_signature_uses_branch_args(self, src: str) -> None:
+        """The condition join @task accepts branch_name and branch_task_id."""
+        tree = _parse(src)
+        fn = _find_fn(tree, "_step_join")
+        assert fn is not None
+        arg_names = [a.arg for a in fn.args.args]
+        assert "branch_name" in arg_names
+        assert "branch_task_id" in arg_names
+
+    def test_join_input_paths_uses_branch_vars(self, src: str) -> None:
+        """input_paths for the condition join uses branch_name and branch_task_id."""
+        assert "branch_name" in src
+        assert "branch_task_id" in src
+
+    def test_flow_emits_if_elif_for_branches(self, src: str) -> None:
+        """The flow body has an if/elif block routing to the taken branch."""
+        assert "_tid_start_branch ==" in src or "_tid_start_branch ==" in src
+        # Check for branch-routing pattern
+        assert "if _tid_start_branch ==" in src or "if _tid_start_branch ==" in src
+
+    def test_flow_emits_taken_variable(self, src: str) -> None:
+        """The flow body sets a _tid_start_taken variable for the taken branch's task_id."""
+        assert "_tid_start_taken" in src
+
+    def test_flow_calls_join_with_branch_vars(self, src: str) -> None:
+        """The join call passes branch and taken variables."""
+        assert "_step_join(run_id, _tid_start_branch, _tid_start_taken)" in src
+
+    def test_branch_steps_not_called_unconditionally(self, src: str) -> None:
+        """Branch steps are only called inside the if/elif block, not unconditionally."""
+        # No line should call _step_high_branch or _step_low_branch at the top level
+        # (i.e., with no leading whitespace before the call).
+        lines = src.splitlines()
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("_step_high_branch(") or stripped.startswith("_step_low_branch("):
+                # Must be indented (inside if/elif block)
+                assert line != stripped, (
+                    f"Branch step called unconditionally (no indent): {line!r}"
+                )
+
+    def test_else_raises_runtime_error(self, src: str) -> None:
+        """The flow emits an else clause that raises RuntimeError for unknown branches."""
+        assert "raise RuntimeError" in src
+        assert "Unexpected condition branch" in src
