@@ -22,6 +22,33 @@ from metaflow_extensions.prefect.plugins.prefect._types import FlowSpec, Prefect
 _log = logging.getLogger(__name__)
 
 
+def _extract_flow_config_value(flow: Any) -> str | None:
+    """Extract compile-time config values from the flow and return as a JSON string.
+
+    This mirrors what the Airflow and Step Functions deployers do: they read
+    ``flow._flow_state[FlowStateItems.CONFIGS]`` at compile time and embed the
+    result as ``METAFLOW_FLOW_CONFIG_VALUE`` in the generated step subprocess
+    environment, so that config_expr / @project decorators evaluate correctly at
+    task runtime.
+    """
+    import json
+
+    try:
+        from metaflow.flowspec import FlowStateItems
+
+        flow_configs = flow._flow_state[FlowStateItems.CONFIGS]
+        config_env = {
+            name: value
+            for name, (value, _is_plain) in flow_configs.items()
+            if value is not None
+        }
+        if config_env:
+            return json.dumps(config_env)
+    except Exception:
+        pass
+    return None
+
+
 class PrefectFlow:
     """Compile a Metaflow flow into a runnable Prefect flow Python file.
 
@@ -53,6 +80,7 @@ class PrefectFlow:
         workflow_timeout: int | None = None,
         with_decorators: list[str] | None = None,
         origin_run_id: str | None = None,
+        flow_config_value: str | None = None,
     ) -> None:
         self._graph = graph
         self._flow = flow
@@ -65,6 +93,12 @@ class PrefectFlow:
         datastore_root = getattr(
             getattr(flow_datastore, "_storage_impl", None), "datastore_root", None
         )
+
+        # Capture METAFLOW_FLOW_CONFIG_VALUE from the flow's compile-time config state.
+        # This must be propagated to every step subprocess so that config_expr / @project
+        # decorators evaluate correctly at task runtime (same approach as Airflow/SFN).
+        if flow_config_value is None:
+            flow_config_value = _extract_flow_config_value(flow)
 
         self._cfg = PrefectFlowConfig(
             flow_file=self._flow_file,
@@ -82,6 +116,7 @@ class PrefectFlow:
             with_decorators=tuple(with_decorators or []),
             workflow_timeout=workflow_timeout,
             origin_run_id=origin_run_id,
+            flow_config_value=flow_config_value,
         )
 
     def compile(self) -> str:

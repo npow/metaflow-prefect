@@ -99,15 +99,82 @@ class PrefectDeployedFlow(DeployedFlow):
 
     @classmethod
     def from_deployment(cls, identifier: str, metadata: str | None = None) -> PrefectDeployedFlow:
-        """Recover a PrefectDeployedFlow from a deployment identifier."""
-        import json
+        """Recover a PrefectDeployedFlow from a deployment name.
 
-        from .prefect_deployer import PrefectDeployer
+        Parameters
+        ----------
+        identifier : str
+            Prefect deployment name (the value returned by ``deployed_flow.deployer.name``).
+        metadata : str, optional
+            Optional metadata string (unused, kept for API compatibility).
 
-        info = json.loads(identifier)
-        deployer = PrefectDeployer(flow_file=info["flow_file"], deployer_kwargs={})
-        deployer.name = info["name"]
-        deployer.flow_name = info["flow_name"]
+        Returns
+        -------
+        PrefectDeployedFlow
+        """
+        import asyncio
+        import tempfile
+
+        from metaflow.runner.deployer import Deployer, generate_fake_flow_file_contents
+
+        deployment_name = identifier
+
+        # Query Prefect to find the flow name for this deployment.
+        async def _get_flow_info(name: str) -> tuple[str, str | None]:
+            """Return (metaflow_class_name, project_name_or_None)."""
+            try:
+                from prefect.client.orchestration import get_client
+                from prefect.client.schemas.filters import (
+                    DeploymentFilter,
+                    DeploymentFilterName,
+                )
+
+                async with get_client() as client:
+                    deployments = await client.read_deployments(
+                        deployment_filter=DeploymentFilter(
+                            name=DeploymentFilterName(any_=[name])
+                        )
+                    )
+                    if not deployments:
+                        return name, None
+                    deployment = deployments[0]
+                    flow = await client.read_flow(deployment.flow_id)
+                    # Prefect flow name may be "project.FlowName" — split out the parts.
+                    prefect_flow_name = flow.name
+                    if "." in prefect_flow_name:
+                        project_name, mf_flow_name = prefect_flow_name.rsplit(".", 1)
+                    else:
+                        project_name = None
+                        mf_flow_name = prefect_flow_name
+                    return mf_flow_name, project_name
+            except Exception:
+                return name, None
+
+        # Run async query; if already inside an event loop fall back gracefully.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    flow_name, project_name = pool.submit(
+                        asyncio.run, _get_flow_info(deployment_name)
+                    ).result()
+            else:
+                flow_name, project_name = asyncio.run(_get_flow_info(deployment_name))
+        except Exception:
+            flow_name, project_name = deployment_name, None
+
+        fake_flow_contents = generate_fake_flow_file_contents(
+            flow_name=flow_name, param_info={}, project_name=project_name
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as tmp:
+            tmp.write(fake_flow_contents)
+            fake_flow_path = tmp.name
+
+        deployer = Deployer(fake_flow_path).prefect()
+        deployer.name = deployment_name
+        deployer.flow_name = flow_name
         deployer.metadata = metadata or "{}"
         deployer.additional_info = {}
         return cls(deployer=deployer)

@@ -311,6 +311,7 @@ def _build_header(
         "WITH_DECORATORS: list[str] = %r" % list(cfg.with_decorators),
         "ORIGIN_RUN_ID: str | None = %r" % cfg.origin_run_id,
         "STEP_CMD_TEMPLATES: dict[str, tuple[str, ...]] = %r" % dict(cmd_templates),
+        "FLOW_CONFIG_VALUE: str | None = %r" % cfg.flow_config_value,
     ]
     return "\n".join(lines)
 
@@ -415,6 +416,10 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
     # Ensure local metadata writes to $HOME/.metaflow/ regardless of CWD
     # (Prefect workers may run from a temp directory).
     lines.append('_extra_env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = os.path.expanduser("~")')
+    # Propagate compile-time config values so that config_expr / @project decorators
+    # evaluate correctly at task runtime (mirrors Airflow and Step Functions deployers).
+    lines.append("if FLOW_CONFIG_VALUE:")
+    lines.append(_INDENT + '_extra_env["METAFLOW_FLOW_CONFIG_VALUE"] = FLOW_CONFIG_VALUE')
     lines += _ctx_inject_lines()
 
     if step.env_vars:
@@ -509,6 +514,8 @@ def _start_init_lines() -> list[str]:
         _INDENT + 'init_cmd += ["--tag", _tag]',
         "init_env: dict[str, str] = os.environ.copy()",
         'init_env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = os.path.expanduser("~")',
+        "if FLOW_CONFIG_VALUE:",
+        _INDENT + 'init_env["METAFLOW_FLOW_CONFIG_VALUE"] = FLOW_CONFIG_VALUE',
         "if parameters:",
         _INDENT + 'init_env["METAFLOW_PARAMETERS"] = json.dumps(parameters)',
         "_run_cmd(init_cmd, extra_env=init_env)",

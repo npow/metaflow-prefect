@@ -108,3 +108,4 @@ class PrefectFlowConfig:
     with_decorators: tuple[str, ...] = ()  # extra --with=<deco> injected on every step
     workflow_timeout: int | None = None    # from --workflow-timeout (seconds)
     origin_run_id: str | None = None       # from --clone-run-id (resume support)
+    flow_config_value: str | None = None   # JSON-serialised METAFLOW_FLOW_CONFIG_VALUE
