@@ -312,10 +312,11 @@ def trigger(
     from ._graph import _extract_project
     project_name = _extract_project(obj.flow)  # type: ignore[attr-defined]
     metaflow_flow_name = obj.flow.name  # type: ignore[attr-defined]
-    flow_name = f"{project_name}.{metaflow_flow_name}" if project_name else metaflow_flow_name
+    prefect_flow_name = f"{project_name}.{metaflow_flow_name}" if project_name else metaflow_flow_name
     asyncio.run(
         _trigger_deployment(
-            flow_name=flow_name,
+            prefect_flow_name=prefect_flow_name,
+            metaflow_flow_name=metaflow_flow_name,
             deployment_name=name,
             params=params,
             deployer_attribute_file=deployer_attribute_file,
@@ -539,7 +540,8 @@ async def _sync_automations(
 
 
 async def _trigger_deployment(
-    flow_name: str,
+    prefect_flow_name: str,
+    metaflow_flow_name: str,
     deployment_name: str,
     params: dict[str, str],
     deployer_attribute_file: str | None,
@@ -562,12 +564,12 @@ async def _trigger_deployment(
 
     async with get_client() as client:
         deployments = await client.read_deployments(
-            flow_filter=FlowFilter(name=FlowFilterName(any_=[flow_name])),
+            flow_filter=FlowFilter(name=FlowFilterName(any_=[prefect_flow_name])),
             deployment_filter=DeploymentFilter(name=DeploymentFilterName(any_=[deployment_name])),
         )
         if not deployments:
             raise PrefectException(
-                f"No deployment named {deployment_name!r} found for flow {flow_name!r}."
+                f"No deployment named {deployment_name!r} found for flow {prefect_flow_name!r}."
             )
         deployment = deployments[0]
         flow_run = await client.create_flow_run_from_deployment(
@@ -576,7 +578,9 @@ async def _trigger_deployment(
         )
 
     run_id = f"prefect-{flow_run.id}"
-    pathspec = f"{flow_name}/{run_id}"
+    # Use the Metaflow flow class name (not the Prefect flow name) for the pathspec
+    # so that metaflow.Run(pathspec) can find the run in local metadata.
+    pathspec = f"{metaflow_flow_name}/{run_id}"
 
     if deployer_attribute_file:
         with open(deployer_attribute_file, "w") as f:
@@ -593,3 +597,4 @@ async def _trigger_deployment(
         f"Triggered Prefect flow run *{flow_run.id}* (pathspec: *{pathspec}*).",
         bold=True,
     )
+
