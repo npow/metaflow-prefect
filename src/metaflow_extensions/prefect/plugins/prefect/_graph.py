@@ -266,9 +266,20 @@ _TYPE_MAP: dict[str, str] = {
 
 
 def _extract_parameters(flow: Any) -> list[ParameterSpec]:
-    """Pull parameters from the flow and evaluate their default values."""
+    """Pull non-Config parameters from the flow and evaluate their default values.
+
+    Config parameters are excluded because they are handled via
+    ``METAFLOW_FLOW_CONFIG_VALUE`` at compile time and should not appear as
+    Prefect flow function parameters.
+    """
     params: list[ParameterSpec] = []
     for _, param in flow._get_parameters():
+        # Skip Config parameters — they are resolved at deploy time via
+        # METAFLOW_FLOW_CONFIG_VALUE and must not be injected as Prefect run
+        # parameters (doing so causes METAFLOW_PARAMETERS to override the
+        # Config values with incorrect types).
+        if getattr(param, "IS_CONFIG_PARAMETER", False):
+            continue
         is_required = bool(_param_kwarg(param, "required"))
         raw_default = _param_kwarg(param, "default")
 

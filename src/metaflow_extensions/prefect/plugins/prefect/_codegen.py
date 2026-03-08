@@ -53,14 +53,29 @@ _HELPERS = textwrap.dedent('''\
     # Runtime helpers (embedded — no external imports needed)
     # ---------------------------------------------------------------------------
 
+    def _get_flow_datastore(run_id: str = None, step_name: str = None, task_id: str = None):
+        """Return a FlowDataStore rooted at the compile-time sysroot.
+
+        DATASTORE_SYSROOT_LOCAL is baked in at compile time so that the Prefect
+        worker reads metadata from the same location the Metaflow step subprocesses
+        write to.  We compute the root directly (appending ".metaflow") rather than
+        calling get_datastore_root_from_config(), which reads the class-level
+        SYSROOT_VAR that is fixed at module import time.
+        """
+        import os as _os
+        from metaflow.datastore import FlowDataStore
+        from metaflow.plugins import DATASTORES
+        _impl = next(d for d in DATASTORES if d.TYPE == DATASTORE_TYPE)
+        # Build the root path directly from the compile-time constant.
+        _root = _os.path.join(DATASTORE_SYSROOT_LOCAL, ".metaflow")
+        _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
+        return _fds
+
+
     def _read_foreach_num_splits(run_id: str, step_name: str, task_id: str) -> int:
         """Read foreach split count from the Metaflow datastore after step completes."""
         try:
-            from metaflow.datastore import FlowDataStore
-            from metaflow.plugins import DATASTORES
-            _impl = next(d for d in DATASTORES if d.TYPE == DATASTORE_TYPE)
-            _root = _impl.get_datastore_root_from_config(lambda *a: None)
-            _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
+            _fds = _get_flow_datastore()
             _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
             return int(_tds["_foreach_num_splits"])
         except Exception as _e:
@@ -72,11 +87,7 @@ _HELPERS = textwrap.dedent('''\
     def _read_condition_branch(run_id: str, step_name: str, task_id: str) -> str:
         """Read the condition branch taken from the Metaflow datastore after step completes."""
         try:
-            from metaflow.datastore import FlowDataStore
-            from metaflow.plugins import DATASTORES
-            _impl = next(d for d in DATASTORES if d.TYPE == DATASTORE_TYPE)
-            _root = _impl.get_datastore_root_from_config(lambda *a: None)
-            _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
+            _fds = _get_flow_datastore()
             _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
             return str(_tds["_transition"])
         except Exception as _e:
@@ -114,11 +125,7 @@ _HELPERS = textwrap.dedent('''\
     def _mf_artifact_names(run_id: str, step_name: str, task_id: str) -> list[str]:
         """Return user-defined artifact names from the Metaflow datastore (no values loaded)."""
         try:
-            from metaflow.datastore import FlowDataStore
-            from metaflow.plugins import DATASTORES
-            _impl = next(d for d in DATASTORES if d.TYPE == DATASTORE_TYPE)
-            _root = _impl.get_datastore_root_from_config(lambda *a: None)
-            _fds = FlowDataStore(FLOW_NAME, None, storage_impl=_impl, ds_root=_root)
+            _fds = _get_flow_datastore()
             _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
             _SKIP = {"name", "input"}  # Metaflow internal artifact names
             return [n for n in _tds if not n.startswith("_") and n not in _SKIP]
@@ -312,6 +319,14 @@ def _build_header(
         "ORIGIN_RUN_ID: str | None = %r" % cfg.origin_run_id,
         "STEP_CMD_TEMPLATES: dict[str, tuple[str, ...]] = %r" % dict(cmd_templates),
         "FLOW_CONFIG_VALUE: str | None = %r" % cfg.flow_config_value,
+        # Bake in the deployer-side METAFLOW_DATASTORE_SYSROOT_LOCAL so that the
+        # Prefect worker writes metadata to the same location the test/deployer reads from,
+        # even if the worker was started with a different (or absent) sysroot env var.
+        (
+            "DATASTORE_SYSROOT_LOCAL: str = %r" % cfg.datastore_sysroot_local
+            if cfg.datastore_sysroot_local is not None
+            else "DATASTORE_SYSROOT_LOCAL: str = os.path.expanduser('~')"
+        ),
     ]
     return "\n".join(lines)
 
@@ -342,8 +357,12 @@ def _task_decorator(step: StepSpec) -> str:
     parts = ['name="%s"' % step.name, "retries=%d" % step.max_user_code_retries]
     if step.timeout_seconds is not None:
         parts.append("timeout_seconds=%d" % step.timeout_seconds)
-    if step.retry_delay_seconds is not None:
-        parts.append("retry_delay_seconds=%d" % step.retry_delay_seconds)
+    # Always set retry_delay_seconds=0 to avoid Prefect's server-side default (120s).
+    # Metaflow's minutes_between_retries is designed for cloud-batch scenarios where the
+    # scheduler introduces the delay by re-queuing the job. In Prefect local execution the
+    # Metaflow step subprocess runs inline, so there is no scheduler-level delay; adding
+    # an artificial wait here only lengthens test runs without benefit.
+    parts.append("retry_delay_seconds=0")
     resource_tags = []
     if step.resource_cpu is not None:
         resource_tags.append("resource:cpu=%d" % step.resource_cpu)
@@ -413,9 +432,18 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
 
     lines.append("task_id: str = uuid.uuid4().hex[:16]")
     lines.append("_extra_env: dict[str, str] = {}")
-    # Ensure local metadata writes to $HOME/.metaflow/ regardless of CWD
-    # (Prefect workers may run from a temp directory).
-    lines.append('_extra_env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = os.path.expanduser("~")')
+    # Use the compile-time sysroot constant so the worker writes metadata to the
+    # same location the deployer process reads from, regardless of the worker's
+    # own METAFLOW_DATASTORE_SYSROOT_LOCAL setting.
+    lines.append('_extra_env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = DATASTORE_SYSROOT_LOCAL')
+    # Propagate the code package URL/SHA/metadata so that the step subprocess can
+    # extract the code package (needed for Config resolution via kv.<name>).
+    lines.append('if CODE_PACKAGE_URL:')
+    lines.append(_INDENT + '_extra_env["METAFLOW_CODE_URL"] = CODE_PACKAGE_URL')
+    lines.append('if CODE_PACKAGE_SHA:')
+    lines.append(_INDENT + '_extra_env["METAFLOW_CODE_SHA"] = CODE_PACKAGE_SHA')
+    lines.append('if CODE_PACKAGE_METADATA:')
+    lines.append(_INDENT + '_extra_env["METAFLOW_CODE_METADATA"] = CODE_PACKAGE_METADATA')
     # Propagate compile-time config values so that config_expr / @project decorators
     # evaluate correctly at task runtime (mirrors Airflow and Step Functions deployers).
     lines.append("if FLOW_CONFIG_VALUE:")
@@ -432,9 +460,16 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
 
     lines.append(_input_paths_line(step))
 
+    # Derive the Metaflow retry count from Prefect's run_count (1-indexed → 0-indexed).
+    # This ensures that --retry-count N reflects the actual retry attempt, so that
+    # Metaflow decorators like @retry can distinguish between the first attempt and
+    # subsequent retries (e.g. ``if current.retry_count < 1: raise ...``).
+    lines.append("_mf_retry_count: int = max(0, _ctx.task_run.run_count - 1) if _ctx is not None else 0")
+
     lines.append('logger.info(f"Metaflow step \'%s\' task_id={task_id}")' % step.name)
     lines.append("cmd = _step_cmd(")
     lines.append(_INDENT + "%r, run_id, task_id, input_paths," % step.name)
+    lines.append(_INDENT + "retry_count=_mf_retry_count,")
     lines.append(_INDENT + "max_user_code_retries=%d," % step.max_user_code_retries)
     if is_foreach_body:
         lines.append(_INDENT + "split_index=split_index,")
@@ -481,8 +516,13 @@ def _input_paths_line(step: StepSpec) -> str:
 
 
 def _ctx_inject_lines() -> list[str]:
-    """Lines that inject the Prefect run context IDs into the subprocess env."""
+    """Lines that inject the Prefect run context IDs into the subprocess env.
+
+    Also initialises ``_ctx`` so that later code (e.g. retry-count derivation)
+    can safely reference it even when the context is unavailable.
+    """
     return [
+        "_ctx = None",
         "try:",
         _INDENT + "_ctx = get_run_context()",
         _INDENT + '_extra_env["METAFLOW_PREFECT_FLOW_RUN_ID"] = str(_ctx.flow_run.id)',
@@ -513,11 +553,21 @@ def _start_init_lines() -> list[str]:
         "for _tag in TAGS:",
         _INDENT + 'init_cmd += ["--tag", _tag]',
         "init_env: dict[str, str] = os.environ.copy()",
-        'init_env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = os.path.expanduser("~")',
+        'init_env["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = DATASTORE_SYSROOT_LOCAL',
+        'if CODE_PACKAGE_URL:',
+        _INDENT + 'init_env["METAFLOW_CODE_URL"] = CODE_PACKAGE_URL',
+        'if CODE_PACKAGE_SHA:',
+        _INDENT + 'init_env["METAFLOW_CODE_SHA"] = CODE_PACKAGE_SHA',
+        'if CODE_PACKAGE_METADATA:',
+        _INDENT + 'init_env["METAFLOW_CODE_METADATA"] = CODE_PACKAGE_METADATA',
         "if FLOW_CONFIG_VALUE:",
         _INDENT + 'init_env["METAFLOW_FLOW_CONFIG_VALUE"] = FLOW_CONFIG_VALUE',
-        "if parameters:",
-        _INDENT + 'init_env["METAFLOW_PARAMETERS"] = json.dumps(parameters)',
+        # Pass flow parameters as CLI options (e.g. --trigger_param "val") rather than
+        # via METAFLOW_PARAMETERS.  The init subcommand accepts parameters as CLI flags
+        # and this is the correct mechanism for local execution; METAFLOW_PARAMETERS is
+        # only consumed by the Airflow/SFN plumbing steps, not by the standard init cmd.
+        "for _pname, _pval in (parameters or {}).items():",
+        _INDENT + 'init_cmd += [f"--{_pname}", str(_pval) if _pval is not None else ""]',
         "_run_cmd(init_cmd, extra_env=init_env)",
     ]
 

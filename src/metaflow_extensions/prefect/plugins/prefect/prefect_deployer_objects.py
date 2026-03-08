@@ -71,15 +71,63 @@ class PrefectTriggeredRun(TriggeredRun):
 
     @property
     def status(self) -> str | None:
-        """Return a simple status string based on the underlying Metaflow run."""
+        """Return a simple status string based on the Metaflow run and Prefect flow run state.
+
+        When the Metaflow run is not yet finished we also poll the Prefect flow run to
+        detect terminal failures early (e.g. a step that exhausted all retries).
+        """
+        import asyncio
+
         run = self.run
         if run is None:
+            # Run hasn't appeared in Metaflow metadata yet — check Prefect to see if
+            # the flow run already failed before the init step could create the run.
+            try:
+                _, prefect_run_id = self.pathspec.split("/", 1)
+                if prefect_run_id.startswith("prefect-"):
+                    flow_run_id = prefect_run_id[len("prefect-"):]
+                    prefect_state = _get_prefect_flow_run_state(flow_run_id)
+                    if prefect_state and prefect_state.upper() in ("FAILED", "CRASHED", "CANCELLED"):
+                        return "FAILED"
+            except Exception:
+                pass
             return "PENDING"
         if run.successful:
             return "SUCCEEDED"
         if run.finished:
             return "FAILED"
+        # Metaflow run exists but not finished — check Prefect for terminal failures.
+        try:
+            _, prefect_run_id = self.pathspec.split("/", 1)
+            if prefect_run_id.startswith("prefect-"):
+                flow_run_id = prefect_run_id[len("prefect-"):]
+                prefect_state = _get_prefect_flow_run_state(flow_run_id)
+                if prefect_state and prefect_state.upper() in ("FAILED", "CRASHED", "CANCELLED"):
+                    return "FAILED"
+        except Exception:
+            pass
         return "RUNNING"
+
+
+def _get_prefect_flow_run_state(flow_run_id: str) -> str | None:
+    """Query the Prefect API for the state of a flow run. Returns state name or None."""
+    import asyncio
+
+    async def _fetch(frid: str) -> str | None:
+        try:
+            from prefect.client.orchestration import get_client
+            async with get_client() as client:
+                flow_run = await client.read_flow_run(frid)
+                return flow_run.state_name if flow_run.state_name else None
+        except Exception:
+            return None
+
+    import concurrent.futures
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, _fetch(flow_run_id)).result(timeout=5)
+    except Exception:
+        return None
 
 
 class PrefectDeployedFlow(DeployedFlow):
@@ -150,17 +198,15 @@ class PrefectDeployedFlow(DeployedFlow):
             except Exception:
                 return name, None
 
-        # Run async query; if already inside an event loop fall back gracefully.
+        # Always run the async query in a fresh daemon thread with its own event loop.
+        # This avoids conflicts with any existing event loop in the calling thread
+        # (e.g. Prefect's internal loop that may be running during test teardown).
+        import concurrent.futures
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    flow_name, project_name = pool.submit(
-                        asyncio.run, _get_flow_info(deployment_name)
-                    ).result()
-            else:
-                flow_name, project_name = asyncio.run(_get_flow_info(deployment_name))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                flow_name, project_name = pool.submit(
+                    asyncio.run, _get_flow_info(deployment_name)
+                ).result(timeout=30)
         except Exception:
             flow_name, project_name = deployment_name, None
 

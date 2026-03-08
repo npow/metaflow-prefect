@@ -22,6 +22,30 @@ from metaflow_extensions.prefect.plugins.prefect._types import FlowSpec, Prefect
 _log = logging.getLogger(__name__)
 
 
+def _strip_kv_config_values(args: list[str]) -> list[str]:
+    """Remove '--config-value NAME kv.NAME' triplets from a command-line arg list.
+
+    For Prefect local execution the code package is not extracted to disk, so
+    ``kv.<name>`` references that expect a CONFIG_PARAMETERS file cannot be
+    resolved.  Config values are propagated via ``METAFLOW_FLOW_CONFIG_VALUE``
+    instead, so these CLI args are redundant and must be removed to avoid the
+    "Could not load expected configuration values" error.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        if (
+            args[i] == "--config-value"
+            and i + 2 < len(args)
+            and args[i + 2].startswith("kv.")
+        ):
+            i += 3  # skip --config-value, NAME, kv.NAME
+            continue
+        out.append(args[i])
+        i += 1
+    return out
+
+
 def _extract_flow_config_value(flow: Any) -> str | None:
     """Extract compile-time config values from the flow and return as a JSON string.
 
@@ -100,6 +124,15 @@ class PrefectFlow:
         if flow_config_value is None:
             flow_config_value = _extract_flow_config_value(flow)
 
+        # Capture the sysroot at compile time so the generated file bakes it in.
+        # This ensures the Prefect worker writes Metaflow metadata to the same
+        # location the deployer process reads from, even when the worker was started
+        # with a different METAFLOW_DATASTORE_SYSROOT_LOCAL (or none at all).
+        import os as _os
+        datastore_sysroot_local = _os.environ.get(
+            "METAFLOW_DATASTORE_SYSROOT_LOCAL", _os.path.expanduser("~")
+        )
+
         self._cfg = PrefectFlowConfig(
             flow_file=self._flow_file,
             datastore_type=flow_datastore.TYPE,
@@ -117,6 +150,7 @@ class PrefectFlow:
             workflow_timeout=workflow_timeout,
             origin_run_id=origin_run_id,
             flow_config_value=flow_config_value,
+            datastore_sysroot_local=datastore_sysroot_local,
         )
 
     def compile(self) -> str:
@@ -227,7 +261,13 @@ class PrefectFlow:
                 args.command_options["namespace"] = self._namespace or spec.namespace or ""
                 args.command_options["split-index"] = split_token
 
-                templates[step.name] = tuple(args.get_args())
+                raw_args = args.get_args()
+                # Strip '--config-value NAME kv.NAME' triplets from the command.
+                # For Prefect local execution the code package is not extracted, so
+                # kv.<name> references cannot be resolved. Config values are instead
+                # propagated via METAFLOW_FLOW_CONFIG_VALUE (set in _extra_env).
+                raw_args = _strip_kv_config_values(raw_args)
+                templates[step.name] = tuple(raw_args)
             except Exception as exc:
                 _log.debug(
                     "Could not build command template for step %r; "

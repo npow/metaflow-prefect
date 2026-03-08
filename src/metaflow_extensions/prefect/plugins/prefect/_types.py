@@ -109,3 +109,4 @@ class PrefectFlowConfig:
     workflow_timeout: int | None = None    # from --workflow-timeout (seconds)
     origin_run_id: str | None = None       # from --clone-run-id (resume support)
     flow_config_value: str | None = None   # JSON-serialised METAFLOW_FLOW_CONFIG_VALUE
+    datastore_sysroot_local: str | None = None  # METAFLOW_DATASTORE_SYSROOT_LOCAL at compile time
