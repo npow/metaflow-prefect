@@ -192,7 +192,7 @@ class PrefectDeployedFlow(DeployedFlow):
         PrefectTriggeredRun
         """
         # Convert kwargs to "key=value" strings for --run-param.
-        run_params = tuple(f"{k}={v}" for k, v in kwargs.items())
+        run_params = [f"{k}={v}" for k, v in kwargs.items()]
 
         with temporary_fifo() as (attribute_file_path, attribute_file_fd):
             trigger_kwargs = dict(name=self.name, deployer_attribute_file=attribute_file_path)
