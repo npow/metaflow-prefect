@@ -443,8 +443,8 @@ class TestDecoratorCodegen:
         assert "timeout_seconds=300" in src
 
     def test_retry_delay_in_task_decorator(self, src: str) -> None:
-        """@retry(minutes_between_retries=1) → retry_delay_seconds=60 on @task."""
-        assert "retry_delay_seconds=60" in src
+        """retry_delay_seconds is always set to 0 in Prefect (Metaflow retries via scheduler)."""
+        assert "retry_delay_seconds=0" in src
 
     def test_retry_count_in_task_decorator(self, src: str) -> None:
         assert "retries=2" in src

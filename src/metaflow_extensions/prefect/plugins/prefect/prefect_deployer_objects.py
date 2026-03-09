@@ -159,11 +159,21 @@ class PrefectDeployedFlow(DeployedFlow):
         PrefectDeployedFlow
         """
         import asyncio
+        import json
         import tempfile
 
         from metaflow.runner.deployer import Deployer, generate_fake_flow_file_contents
 
-        deployment_name = identifier
+        # The identifier may be a JSON blob from the ``id`` property or a plain name.
+        try:
+            id_data = json.loads(identifier)
+            deployment_name = id_data.get("name", identifier)
+            _known_flow_name = id_data.get("flow_name")
+            _known_flow_file = id_data.get("flow_file")
+        except (json.JSONDecodeError, AttributeError):
+            deployment_name = identifier
+            _known_flow_name = None
+            _known_flow_file = None
 
         # Query Prefect to find the flow name for this deployment.
         async def _get_flow_info(name: str) -> tuple[str, str | None]:
@@ -196,17 +206,23 @@ class PrefectDeployedFlow(DeployedFlow):
             except Exception:
                 return name, None
 
-        # Always run the async query in a fresh daemon thread with its own event loop.
-        # This avoids conflicts with any existing event loop in the calling thread
-        # (e.g. Prefect's internal loop that may be running during test teardown).
-        import concurrent.futures
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                flow_name, project_name = pool.submit(
-                    asyncio.run, _get_flow_info(deployment_name)
-                ).result(timeout=30)
-        except Exception:
-            flow_name, project_name = deployment_name, None
+        # If the identifier came from the ``id`` property, we already know the flow name.
+        # Otherwise query Prefect to find the flow name for this deployment.
+        if _known_flow_name is not None:
+            flow_name = _known_flow_name
+            project_name = None
+        else:
+            # Always run the async query in a fresh daemon thread with its own event loop.
+            # This avoids conflicts with any existing event loop in the calling thread
+            # (e.g. Prefect's internal loop that may be running during test teardown).
+            import concurrent.futures
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    flow_name, project_name = pool.submit(
+                        asyncio.run, _get_flow_info(deployment_name)
+                    ).result(timeout=30)
+            except Exception:
+                flow_name, project_name = deployment_name, None
 
         fake_flow_contents = generate_fake_flow_file_contents(
             flow_name=flow_name, param_info={}, project_name=project_name
