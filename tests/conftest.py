@@ -56,23 +56,26 @@ def _load_flow_graph(flow_file: str) -> tuple[Any, Any]:
 
             # _flow_decorators is an instance property backed by cls._flow_state,
             # so we create a minimal proxy that satisfies analyze_graph's interface.
+            # Capture cls in a local variable to avoid B023 loop-variable closure warnings.
+            _bound_cls = cls
+
             class _FlowProxy:
-                name = cls.__name__
-                _graph = cls._graph
+                name = _bound_cls.__name__
+                _graph = _bound_cls._graph
 
                 def _get_parameters(self):  # type: ignore[override]
-                    return cls._get_parameters()
+                    return _bound_cls._get_parameters()  # noqa: B023
 
                 @property
                 def _flow_decorators(self):  # type: ignore[override]
-                    return cls._flow_decorators.fget(self)  # type: ignore[attr-defined]
+                    return _bound_cls._flow_decorators.fget(self)  # type: ignore[attr-defined]  # noqa: B023
 
                 # Make the proxy look up attributes on cls for decorator access
                 def __getattr__(self, item):  # type: ignore[misc]
-                    return getattr(cls, item)
+                    return getattr(_bound_cls, item)  # noqa: B023
 
             # Bind _flow_state so the property getter works
-            _FlowProxy._flow_state = cls._flow_state  # type: ignore[attr-defined]
+            _FlowProxy._flow_state = _bound_cls._flow_state  # type: ignore[attr-defined]
 
             return graph, _FlowProxy()
 

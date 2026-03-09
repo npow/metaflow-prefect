@@ -234,12 +234,12 @@ class PrefectFlow:
                 if step.resource_cpu is not None or step.resource_memory is not None or step.resource_gpu is not None:
                     resource_parts = []
                     if step.resource_cpu is not None:
-                        resource_parts.append("cpu=%d" % step.resource_cpu)
+                        resource_parts.append(f"cpu={step.resource_cpu:d}")
                     if step.resource_memory is not None:
-                        resource_parts.append("memory=%d" % step.resource_memory)
+                        resource_parts.append(f"memory={step.resource_memory:d}")
                     if step.resource_gpu is not None:
-                        resource_parts.append("gpu=%d" % step.resource_gpu)
-                    resources_deco = "resources:%s" % ",".join(resource_parts)
+                        resource_parts.append(f"gpu={step.resource_gpu:d}")
+                    resources_deco = f"resources:{','.join(resource_parts)}"
                     if resources_deco not in with_opts:
                         with_opts.append(resources_deco)
                 args.top_level_options["with"] = with_opts

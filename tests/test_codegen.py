@@ -25,12 +25,12 @@ from metaflow_extensions.prefect.plugins.prefect._types import (
 
 
 def _make_cfg(**kwargs: Any) -> PrefectFlowConfig:
-    defaults = dict(
-        flow_file="/flows/myflow.py",
-        datastore_type="local",
-        metadata_type="local",
-        username="tester",
-    )
+    defaults = {
+        "flow_file": "/flows/myflow.py",
+        "datastore_type": "local",
+        "metadata_type": "local",
+        "username": "tester",
+    }
     defaults.update(kwargs)
     return PrefectFlowConfig(**defaults)
 

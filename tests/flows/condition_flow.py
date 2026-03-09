@@ -19,12 +19,12 @@ class ConditionFlow(FlowSpec):
 
     @step
     def high_branch(self):
-        self.result = "HIGH: %d" % self.value
+        self.result = f"HIGH: {self.value:d}"
         self.next(self.join)
 
     @step
     def low_branch(self):
-        self.result = "LOW: %d" % self.value
+        self.result = f"LOW: {self.value:d}"
         self.next(self.join)
 
     @step

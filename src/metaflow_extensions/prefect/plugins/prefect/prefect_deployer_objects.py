@@ -76,8 +76,6 @@ class PrefectTriggeredRun(TriggeredRun):
         When the Metaflow run is not yet finished we also poll the Prefect flow run to
         detect terminal failures early (e.g. a step that exhausted all retries).
         """
-        import asyncio
-
         run = self.run
         if run is None:
             # Run hasn't appeared in Metaflow metadata yet — check Prefect to see if
@@ -241,7 +239,7 @@ class PrefectDeployedFlow(DeployedFlow):
         run_params = [f"{k}={v}" for k, v in kwargs.items()]
 
         with temporary_fifo() as (attribute_file_path, attribute_file_fd):
-            trigger_kwargs = dict(name=self.name, deployer_attribute_file=attribute_file_path)
+            trigger_kwargs = {"name": self.name, "deployer_attribute_file": attribute_file_path}
             if run_params:
                 trigger_kwargs["run_params"] = run_params
             command = get_lower_level_group(

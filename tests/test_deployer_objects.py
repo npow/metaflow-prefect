@@ -2,9 +2,16 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from metaflow_extensions.prefect.plugins.prefect.prefect_deployer_objects import (
+        PrefectDeployedFlow,
+        PrefectTriggeredRun,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -12,7 +19,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def _make_triggered_run(pathspec: str) -> "PrefectTriggeredRun":
+def _make_triggered_run(pathspec: str) -> PrefectTriggeredRun:
     from metaflow_extensions.prefect.plugins.prefect.prefect_deployer_objects import (
         PrefectTriggeredRun,
     )
@@ -92,7 +99,7 @@ class TestPrefectTriggeredRunRun:
         original = os.environ.copy()
         with patch("metaflow.Run", side_effect=MetaflowNotFound("not found")):
             with patch("metaflow.metadata"):
-                run.run
+                _ = run.run
         # Env should be restored to its original state
         assert os.environ.get("METAFLOW_DEFAULT_METADATA") == original.get(
             "METAFLOW_DEFAULT_METADATA"
@@ -104,7 +111,7 @@ class TestPrefectTriggeredRunRun:
 # ---------------------------------------------------------------------------
 
 
-def _make_deployed_flow(name: str = "my-deploy", flow_name: str = "MyFlow") -> "PrefectDeployedFlow":
+def _make_deployed_flow(name: str = "my-deploy", flow_name: str = "MyFlow") -> PrefectDeployedFlow:
     from metaflow_extensions.prefect.plugins.prefect.prefect_deployer_objects import (
         PrefectDeployedFlow,
     )
