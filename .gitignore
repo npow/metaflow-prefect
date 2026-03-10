@@ -18,3 +18,4 @@ htmlcov/
 /tmp/
 .metaflow/
 CLAUDE.md
+coverage.xml
