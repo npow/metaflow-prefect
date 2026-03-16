@@ -460,12 +460,12 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
     # This ensures that --retry-count N reflects the actual retry attempt, so that
     # Metaflow decorators like @retry can distinguish between the first attempt and
     # subsequent retries (e.g. ``if current.retry_count < 1: raise ...``).
-    lines.append("_mf_retry_count: int = max(0, _ctx.task_run.run_count - 1) if _ctx is not None else 0")
+    lines.append("_step_attempt: int = max(0, _ctx.task_run.run_count - 1) if _ctx is not None else 0")
 
     lines.append('logger.info(f"Metaflow step \'%s\' task_id={task_id}")' % step.name)
     lines.append("cmd = _step_cmd(")
     lines.append(_INDENT + "%r, run_id, task_id, input_paths," % step.name)
-    lines.append(_INDENT + "retry_count=_mf_retry_count,")
+    lines.append(_INDENT + "retry_count=_step_attempt,")
     lines.append(_INDENT + "max_user_code_retries=%d," % step.max_user_code_retries)
     if is_foreach_body:
         lines.append(_INDENT + "split_index=split_index,")
@@ -474,7 +474,7 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
     lines += _artifact_lines(step)
 
     if step.node_type == NodeType.FOREACH:
-        lines.append("num_splits: int = _read_foreach_num_splits(run_id, %r, task_id, _mf_retry_count)" % step.name)
+        lines.append("num_splits: int = _read_foreach_num_splits(run_id, %r, task_id, _step_attempt)" % step.name)
         lines.append("return task_id, num_splits")
     elif step.node_type == NodeType.SPLIT_SWITCH:
         lines.append("branch_taken: str = _read_condition_branch(run_id, %r, task_id)" % step.name)
@@ -572,7 +572,7 @@ def _artifact_lines(step: StepSpec) -> list[str]:
     """Lines that publish a Prefect markdown artifact listing Metaflow artifacts."""
     artifact_key = step.name.replace("_", "-")
     return [
-        "_art_names = _mf_artifact_names(run_id, %r, task_id, _mf_retry_count)" % step.name,
+        "_art_names = _mf_artifact_names(run_id, %r, task_id, _step_attempt)" % step.name,
         '_md = f"## `%s` — {run_id}\\n\\n"' % step.name,
         "if _art_names:",
         _INDENT + "for _n in _art_names:",
