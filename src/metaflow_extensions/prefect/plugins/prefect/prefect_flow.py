@@ -258,7 +258,9 @@ class PrefectFlow:
                 args.command_options["retry-count"] = retry_token
                 args.command_options["max-user-code-retries"] = max_retry_token
                 args.command_options["tag"] = list(spec.tags)
-                args.command_options["namespace"] = self._namespace or spec.namespace or ""
+                ns = self._namespace or spec.namespace or ""
+                if ns:
+                    args.command_options["namespace"] = ns
                 args.command_options["split-index"] = split_token
 
                 raw_args = args.get_args()

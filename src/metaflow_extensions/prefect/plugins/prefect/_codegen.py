@@ -72,11 +72,11 @@ _HELPERS = textwrap.dedent('''\
         return _fds
 
 
-    def _read_foreach_num_splits(run_id: str, step_name: str, task_id: str) -> int:
+    def _read_foreach_num_splits(run_id: str, step_name: str, task_id: str, attempt: int = 0) -> int:
         """Read foreach split count from the Metaflow datastore after step completes."""
         try:
             _fds = _get_flow_datastore()
-            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
+            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=attempt, mode="r")
             return int(_tds["_foreach_num_splits"])
         except Exception as _e:
             raise RuntimeError(
@@ -89,7 +89,7 @@ _HELPERS = textwrap.dedent('''\
         try:
             _fds = _get_flow_datastore()
             _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
-            return str(_tds["_transition"])
+            return str(_tds["_transition"][0][0])
         except Exception as _e:
             raise RuntimeError(
                 f"Could not read condition branch for {step_name}/{task_id}: {_e}"
@@ -122,11 +122,11 @@ _HELPERS = textwrap.dedent('''\
             raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
-    def _mf_artifact_names(run_id: str, step_name: str, task_id: str) -> list[str]:
+    def _mf_artifact_names(run_id: str, step_name: str, task_id: str, attempt: int = 0) -> list[str]:
         """Return user-defined artifact names from the Metaflow datastore (no values loaded)."""
         try:
             _fds = _get_flow_datastore()
-            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
+            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=attempt, mode="r")
             _SKIP = {"name", "input"}  # Metaflow internal artifact names
             return [n for n in _tds if not n.startswith("_") and n not in _SKIP]
         except Exception:
@@ -357,12 +357,9 @@ def _task_decorator(step: StepSpec) -> str:
     parts = ['name="%s"' % step.name, "retries=%d" % step.max_user_code_retries]
     if step.timeout_seconds is not None:
         parts.append("timeout_seconds=%d" % step.timeout_seconds)
-    # Always set retry_delay_seconds=0 to avoid Prefect's server-side default (120s).
-    # Metaflow's minutes_between_retries is designed for cloud-batch scenarios where the
-    # scheduler introduces the delay by re-queuing the job. In Prefect local execution the
-    # Metaflow step subprocess runs inline, so there is no scheduler-level delay; adding
-    # an artificial wait here only lengthens test runs without benefit.
-    parts.append("retry_delay_seconds=0")
+    # Forward @retry(minutes_between_retries=N) to Prefect; default to 0 to avoid
+    # Prefect's server-side default (120s) when no retry delay is configured.
+    parts.append("retry_delay_seconds=%d" % (step.retry_delay_seconds or 0))
     resource_tags = []
     if step.resource_cpu is not None:
         resource_tags.append("resource:cpu=%d" % step.resource_cpu)
@@ -432,6 +429,8 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
 
     lines.append("task_id: str = uuid.uuid4().hex[:16]")
     lines.append("_extra_env: dict[str, str] = {}")
+    if step.env_vars:
+        lines.append("_extra_env.update(%r)" % dict(step.env_vars))
     # Use the compile-time sysroot constant so the worker writes metadata to the
     # same location the deployer process reads from, regardless of the worker's
     # own METAFLOW_DATASTORE_SYSROOT_LOCAL setting.
@@ -449,9 +448,6 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
     lines.append("if FLOW_CONFIG_VALUE:")
     lines.append(_INDENT + '_extra_env["METAFLOW_FLOW_CONFIG_VALUE"] = FLOW_CONFIG_VALUE')
     lines += _ctx_inject_lines()
-
-    if step.env_vars:
-        lines.append("_extra_env.update(%r)" % dict(step.env_vars))
 
     # For the start step, the init command runs first and defines param_task_id,
     # which input_paths then references.  For all other steps the assignment is safe.
@@ -478,7 +474,7 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
     lines += _artifact_lines(step)
 
     if step.node_type == NodeType.FOREACH:
-        lines.append("num_splits: int = _read_foreach_num_splits(run_id, %r, task_id)" % step.name)
+        lines.append("num_splits: int = _read_foreach_num_splits(run_id, %r, task_id, _mf_retry_count)" % step.name)
         lines.append("return task_id, num_splits")
     elif step.node_type == NodeType.SPLIT_SWITCH:
         lines.append("branch_taken: str = _read_condition_branch(run_id, %r, task_id)" % step.name)
@@ -576,7 +572,7 @@ def _artifact_lines(step: StepSpec) -> list[str]:
     """Lines that publish a Prefect markdown artifact listing Metaflow artifacts."""
     artifact_key = step.name.replace("_", "-")
     return [
-        "_art_names = _mf_artifact_names(run_id, %r, task_id)" % step.name,
+        "_art_names = _mf_artifact_names(run_id, %r, task_id, _mf_retry_count)" % step.name,
         '_md = f"## `%s` — {run_id}\\n\\n"' % step.name,
         "if _art_names:",
         _INDENT + "for _n in _art_names:",
@@ -653,12 +649,38 @@ def _condition_groups(spec: FlowSpec) -> dict[str, list[str]]:
     }
 
 
+def _condition_branch_all_steps(
+    spec: FlowSpec,
+    condition_groups: dict[str, list[str]],
+) -> set[str]:
+    """Return all step names that appear inside condition branch paths.
+
+    Includes not only the direct branch start steps but also any intermediate
+    linear steps that precede the condition merge step.
+    """
+    step_by_name = {s.name: s for s in spec.steps}
+    all_steps: set[str] = set()
+    for switch_name, branches in condition_groups.items():
+        merge_step = next((s for s in spec.steps if s.condition_switch == switch_name), None)
+        for branch in branches:
+            cur = branch
+            while True:
+                all_steps.add(cur)
+                is_last = merge_step is None or cur in merge_step.in_funcs
+                if is_last:
+                    break
+                cur = step_by_name[cur].out_funcs[0]
+    return all_steps
+
+
 def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
     """Return lines that call each @task in topological order."""
     lines: list[str] = []
 
     # task_id_vars maps step_name → Python variable name holding its task_id.
     task_id_vars: dict[str, str] = {}
+
+    step_by_name = {s.name: s for s in spec.steps}
 
     # Build chains for all outermost foreach steps (supports arbitrary nesting depth).
     chains = _foreach_chains(spec)
@@ -667,15 +689,15 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
     # Steps whose code is generated inside chain blocks — skip in main iteration.
     nested_skip: set[str] = set()
     for outer, chain in chains.items():
-        for _foreach_name, body_name, join_name in chain:
-            nested_skip.add(body_name)
+        for _foreach_name, body_steps, join_name in chain:
+            for b in body_steps:
+                nested_skip.add(b)
             nested_skip.add(join_name)
         nested_skip.discard(outer)         # outermost foreach: called at top level
         nested_skip.discard(chain[0][2])   # outermost join: handled by the is_foreach_join branch
 
     # Branch steps of condition splits are emitted inside if/elif blocks.
-    for branch_list in condition_groups.values():
-        nested_skip.update(branch_list)
+    nested_skip.update(_condition_branch_all_steps(spec, condition_groups))
 
     for step in spec.steps:
         tid_var = "_tid_%s" % step.name
@@ -708,13 +730,25 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
             lines.append("%s: str = %s_pair[0]" % (tid_var, tid_var))
             lines.append("%s_branch: str = %s_pair[1]" % (tid_var, tid_var))
             task_id_vars[step.name] = tid_var
+            merge_step = next((s for s in spec.steps if s.condition_switch == step.name), None)
             for i, branch in enumerate(branches):
                 kw = "if" if i == 0 else "elif"
                 lines.append("%s %s_branch == %r:" % (kw, tid_var, branch))
-                lines.append(
-                    _INDENT + "%s_taken: str = %s(run_id, %s)"
-                    % (tid_var, _task_fn(branch), tid_var)
-                )
+                cur, cur_input = branch, tid_var
+                while True:
+                    is_last = merge_step is None or cur in merge_step.in_funcs
+                    if is_last:
+                        lines.append(
+                            _INDENT + "%s_taken: str = %s(run_id, %s)"
+                            % (tid_var, _task_fn(cur), cur_input)
+                        )
+                        break
+                    cur_var = "_tid_%s" % cur
+                    lines.append(
+                        _INDENT + "%s: str = %s(run_id, %s)"
+                        % (cur_var, _task_fn(cur), cur_input)
+                    )
+                    cur_input, cur = cur_var, step_by_name[cur].out_funcs[0]
             lines.append("else:")
             lines.append(
                 _INDENT + 'raise RuntimeError(f"Unexpected condition branch: {%s_branch}")' % tid_var
@@ -780,13 +814,25 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
             lines.append("%s: str = %s_pair[0]" % (tid_var, tid_var))
             lines.append("%s_branch: str = %s_pair[1]" % (tid_var, tid_var))
             task_id_vars[step.name] = tid_var
+            merge_step = next((s for s in spec.steps if s.condition_switch == step.name), None)
             for i, branch in enumerate(branches):
                 kw = "if" if i == 0 else "elif"
                 lines.append("%s %s_branch == %r:" % (kw, tid_var, branch))
-                lines.append(
-                    _INDENT + "%s_taken: str = %s(run_id, %s)"
-                    % (tid_var, _task_fn(branch), tid_var)
-                )
+                cur, cur_input = branch, tid_var
+                while True:
+                    is_last = merge_step is None or cur in merge_step.in_funcs
+                    if is_last:
+                        lines.append(
+                            _INDENT + "%s_taken: str = %s(run_id, %s)"
+                            % (tid_var, _task_fn(cur), cur_input)
+                        )
+                        break
+                    cur_var = "_tid_%s" % cur
+                    lines.append(
+                        _INDENT + "%s: str = %s(run_id, %s)"
+                        % (cur_var, _task_fn(cur), cur_input)
+                    )
+                    cur_input, cur = cur_var, step_by_name[cur].out_funcs[0]
             lines.append("else:")
             lines.append(
                 _INDENT + 'raise RuntimeError(f"Unexpected condition branch: {%s_branch}")' % tid_var
@@ -803,15 +849,34 @@ def _flow_wiring_lines(spec: FlowSpec) -> list[str]:
     return lines
 
 
+def _collect_body_steps(
+    step_by_name: dict[str, StepSpec],
+    first_body: str,
+    join_name: str,
+) -> list[str]:
+    """Walk out_funcs[0] from first_body until reaching join_name; return all body steps."""
+    steps = [first_body]
+    current = first_body
+    while True:
+        out = step_by_name[current].out_funcs
+        if not out or out[0] == join_name:
+            break
+        steps.append(out[0])
+        current = out[0]
+    return steps
+
+
 def _foreach_chains(
     spec: FlowSpec,
-) -> dict[str, list[tuple[str, str, str]]]:
+) -> dict[str, list[tuple[str, list[str], str]]]:
     """Return {outermost_foreach: chain} for every outermost foreach in the flow.
 
-    Each chain is a list of ``(foreach_name, body_name, join_name)`` tuples ordered
-    outermost-first.  The chain ends when ``body_name`` is NOT itself a foreach step,
-    so ``len(chain) == 1`` for a simple (non-nested) foreach.
+    Each chain is a list of ``(foreach_name, body_steps, join_name)`` tuples ordered
+    outermost-first.  ``body_steps`` is the full list of linear body steps between the
+    foreach and its join.  The chain ends when ``body_steps[0]`` is NOT itself a
+    foreach step, so ``len(chain) == 1`` for a simple (non-nested) foreach.
     """
+    step_by_name = {s.name: s for s in spec.steps}
     # foreach step name → immediate body step name
     foreach_body: dict[str, str] = {
         s.name: s.out_funcs[0]
@@ -823,9 +888,9 @@ def _foreach_chains(
     # Outermost = foreach steps not nested inside another foreach
     outermost = [name for name in foreach_body if name not in nested_foreach]
 
-    chains: dict[str, list[tuple[str, str, str]]] = {}
+    chains: dict[str, list[tuple[str, list[str], str]]] = {}
     for outer in outermost:
-        chain: list[tuple[str, str, str]] = []
+        chain: list[tuple[str, list[str], str]] = []
         current = outer
         while True:
             body = foreach_body[current]
@@ -835,10 +900,15 @@ def _foreach_chains(
                 for s in spec.steps
                 if s.is_foreach_join and s.split_parents and s.split_parents[-1] == current
             )
-            chain.append((current, body, join))
             if body in foreach_body:
+                # Nested: the immediate body is itself a foreach; don't walk further
+                body_steps: list[str] = [body]
+                chain.append((current, body_steps, join))
                 current = body
             else:
+                # Innermost: collect all linear body steps between foreach and join
+                body_steps = _collect_body_steps(step_by_name, body, join)
+                chain.append((current, body_steps, join))
                 break
         chains[outer] = chain
 
@@ -846,7 +916,7 @@ def _foreach_chains(
 
 
 def _chain_wiring_lines(
-    chain: list[tuple[str, str, str]],
+    chain: list[tuple[str, list[str], str]],
     foreach_tid_var: str,
     foreach_nsplits_var: str,
     depth: int = 0,
@@ -856,9 +926,10 @@ def _chain_wiring_lines(
 
     Parameters
     ----------
-    chain : list of (foreach_name, body_name, join_name)
+    chain : list of (foreach_name, body_steps, join_name)
         Chain from current level down to innermost.  ``chain[0]`` is the level
         whose foreach task has already been called (task_id in ``foreach_tid_var``).
+        ``body_steps`` is the full list of linear body steps (len >= 1).
     foreach_tid_var, foreach_nsplits_var :
         Python variable names holding the task_id / nsplits of ``chain[0][0]``.
     depth : int
@@ -879,10 +950,11 @@ def _chain_wiring_lines(
     """
     idx = _IDX[depth] if depth < len(_IDX) else "_idx_%d" % depth
 
-    _, body_name, join_name = chain[0]
+    _, body_steps, join_name = chain[0]
+    body_name = body_steps[0]
 
     if len(chain) == 1:
-        # Innermost level: body_name is a regular (non-foreach) step.
+        # Innermost level: body_steps are regular (non-foreach) steps.
         futures_var = "_futures_%s" % body_name
         result_var = "_tid_%s_list" % body_name
         lines = [
@@ -890,9 +962,19 @@ def _chain_wiring_lines(
             % (futures_var, _task_fn(body_name), foreach_tid_var, idx, idx, foreach_nsplits_var),
             indent + "%s: list[str] = [_f.result() for _f in %s]" % (result_var, futures_var),
         ]
-        return lines, result_var, body_name
+        prev_result_var = result_var
+        for mid_step in body_steps[1:]:
+            fut_var = "_futures_%s" % mid_step
+            res_var = "_tid_%s_list" % mid_step
+            lines += [
+                indent + "%s = [%s.submit(run_id, _tid) for _tid in %s]"
+                % (fut_var, _task_fn(mid_step), prev_result_var),
+                indent + "%s: list[str] = [_f.result() for _f in %s]" % (res_var, fut_var),
+            ]
+            prev_result_var = res_var
+        return lines, prev_result_var, body_steps[-1]
 
-    # Nested: body_name is itself a foreach step — recurse.
+    # Nested: body_steps[0] is itself a foreach step — recurse.
     inner_chain = chain[1:]
     inner_join_name = inner_chain[0][2]
 
