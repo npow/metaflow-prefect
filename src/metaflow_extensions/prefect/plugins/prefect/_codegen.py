@@ -72,11 +72,11 @@ _HELPERS = textwrap.dedent('''\
         return _fds
 
 
-    def _read_foreach_num_splits(run_id: str, step_name: str, task_id: str, attempt: int = 0) -> int:
+    def _read_foreach_num_splits(run_id: str, step_name: str, task_id: str) -> int:
         """Read foreach split count from the Metaflow datastore after step completes."""
         try:
             _fds = _get_flow_datastore()
-            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=attempt, mode="r")
+            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
             return int(_tds["_foreach_num_splits"])
         except Exception as _e:
             raise RuntimeError(
@@ -122,11 +122,11 @@ _HELPERS = textwrap.dedent('''\
             raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
-    def _mf_artifact_names(run_id: str, step_name: str, task_id: str, attempt: int = 0) -> list[str]:
+    def _mf_artifact_names(run_id: str, step_name: str, task_id: str) -> list[str]:
         """Return user-defined artifact names from the Metaflow datastore (no values loaded)."""
         try:
             _fds = _get_flow_datastore()
-            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=attempt, mode="r")
+            _tds = _fds.get_task_datastore(run_id, step_name, task_id, attempt=0, mode="r")
             _SKIP = {"name", "input"}  # Metaflow internal artifact names
             return [n for n in _tds if not n.startswith("_") and n not in _SKIP]
         except Exception:
@@ -474,7 +474,11 @@ def _task_body_lines(step: StepSpec, foreach_body: set[str]) -> list[str]:
     lines += _artifact_lines(step)
 
     if step.node_type == NodeType.FOREACH:
-        lines.append("num_splits: int = _read_foreach_num_splits(run_id, %r, task_id, _mf_retry_count)" % step.name)
+        # Always use attempt=0: each Prefect retry generates a fresh uuid task_id,
+        # so the Metaflow datastore entry for that id is always at attempt=0.
+        # _mf_retry_count is correct for --retry-count (subprocess arg) but NOT
+        # for datastore reads, which must always address attempt=0 of the new id.
+        lines.append("num_splits: int = _read_foreach_num_splits(run_id, %r, task_id)" % step.name)
         lines.append("return task_id, num_splits")
     elif step.node_type == NodeType.SPLIT_SWITCH:
         lines.append("branch_taken: str = _read_condition_branch(run_id, %r, task_id)" % step.name)
@@ -572,7 +576,8 @@ def _artifact_lines(step: StepSpec) -> list[str]:
     """Lines that publish a Prefect markdown artifact listing Metaflow artifacts."""
     artifact_key = step.name.replace("_", "-")
     return [
-        "_art_names = _mf_artifact_names(run_id, %r, task_id, _mf_retry_count)" % step.name,
+        # Same rationale as _read_foreach_num_splits: always attempt=0 for new uuid.
+        "_art_names = _mf_artifact_names(run_id, %r, task_id)" % step.name,
         '_md = f"## `%s` — {run_id}\\n\\n"' % step.name,
         "if _art_names:",
         _INDENT + "for _n in _art_names:",

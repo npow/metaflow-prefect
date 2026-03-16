@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+import threading
 from typing import TYPE_CHECKING, ClassVar
 
 from metaflow.runner.deployer import DeployedFlow, TriggeredRun
@@ -10,6 +12,10 @@ from metaflow.runner.utils import get_lower_level_group, handle_timeout, tempora
 
 if TYPE_CHECKING:
     pass
+
+# Lock guarding os.environ mutations in PrefectTriggeredRun.run.
+# Multiple concurrent status polls would otherwise race on the global env.
+_env_lock = threading.Lock()
 
 
 class PrefectTriggeredRun(TriggeredRun):
@@ -44,30 +50,29 @@ class PrefectTriggeredRun(TriggeredRun):
         meta_type = env_vars.get("METAFLOW_DEFAULT_METADATA")
         sysroot = env_vars.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
 
-        old_meta = os.environ.get("METAFLOW_DEFAULT_METADATA")
-        old_sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
-        try:
-            if meta_type:
-                os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
-                metaflow.metadata(meta_type)
-            if meta_type == "local" and sysroot is None:
-                sysroot = os.path.expanduser("~")
-            if sysroot:
-                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
-            return metaflow.Run(self.pathspec, _namespace_check=False)
-        except MetaflowNotFound:
-            return None
-        except Exception:
-            return None
-        finally:
-            if old_meta is None:
-                os.environ.pop("METAFLOW_DEFAULT_METADATA", None)
-            else:
-                os.environ["METAFLOW_DEFAULT_METADATA"] = old_meta
-            if old_sysroot is None:
-                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
-            else:
-                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old_sysroot
+        with _env_lock:
+            old_meta = os.environ.get("METAFLOW_DEFAULT_METADATA")
+            old_sysroot = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+            try:
+                if meta_type:
+                    os.environ["METAFLOW_DEFAULT_METADATA"] = meta_type
+                    metaflow.metadata(meta_type)
+                if meta_type == "local" and sysroot is None:
+                    sysroot = os.path.expanduser("~")
+                if sysroot:
+                    os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = sysroot
+                return metaflow.Run(self.pathspec, _namespace_check=False)
+            except MetaflowNotFound:
+                return None
+            finally:
+                if old_meta is None:
+                    os.environ.pop("METAFLOW_DEFAULT_METADATA", None)
+                else:
+                    os.environ["METAFLOW_DEFAULT_METADATA"] = old_meta
+                if old_sysroot is None:
+                    os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
+                else:
+                    os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old_sysroot
 
     @property
     def status(self) -> str | None:
@@ -238,6 +243,87 @@ class PrefectDeployedFlow(DeployedFlow):
         deployer.metadata = metadata or "{}"
         deployer.additional_info = {}
         return cls(deployer=deployer)
+
+    @classmethod
+    def list_deployed_flows(cls, flow_name: str | None = None):
+        """Yield PrefectDeployedFlow objects for all matching Prefect deployments.
+
+        Parameters
+        ----------
+        flow_name : str, optional
+            If given, filter to deployments whose Prefect flow name matches
+            (exact or prefix match via Prefect's ``like_`` filter).
+            If None, yield all deployments visible to the Prefect client.
+
+        Yields
+        ------
+        PrefectDeployedFlow
+        """
+        import asyncio
+        import concurrent.futures
+
+        async def _list(fname: str | None):
+            try:
+                from prefect.client.orchestration import get_client
+                async with get_client() as client:
+                    if fname:
+                        from prefect.client.schemas.filters import (
+                            DeploymentFilter,
+                            DeploymentFilterName,
+                        )
+                        deployments = await client.read_deployments(
+                            deployment_filter=DeploymentFilter(
+                                name=DeploymentFilterName(like_=fname)
+                            )
+                        )
+                    else:
+                        deployments = await client.read_deployments()
+                    return deployments
+            except Exception:
+                return []
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                deployments = pool.submit(asyncio.run, _list(flow_name)).result(timeout=30)
+        except Exception:
+            deployments = []
+
+        for dep in deployments:
+            try:
+                yield cls.from_deployment(dep.name)
+            except Exception:
+                continue
+
+    @classmethod
+    def get_triggered_run(
+        cls,
+        identifier: str,
+        run_id: str,
+        metadata: str | None = None,
+    ) -> PrefectTriggeredRun:
+        """Reconstruct a PrefectTriggeredRun from a deployment identifier and run ID.
+
+        Parameters
+        ----------
+        identifier : str
+            Prefect deployment name or JSON identifier (as returned by ``deployed_flow.id``).
+        run_id : str
+            The Metaflow run ID (e.g. ``"prefect-<uuid>"``).
+        metadata : str, optional
+            Optional metadata string (kept for API compatibility).
+
+        Returns
+        -------
+        PrefectTriggeredRun
+        """
+        deployed_flow = cls.from_deployment(identifier, metadata)
+        pathspec = f"{deployed_flow.flow_name}/{run_id}"
+        content = json.dumps({
+            "pathspec": pathspec,
+            "name": run_id,
+            "metadata": metadata or "{}",
+        })
+        return PrefectTriggeredRun(deployer=deployed_flow.deployer, content=content)
 
     def run(self, **kwargs) -> PrefectTriggeredRun:
         """Trigger a new run of this deployed flow.
