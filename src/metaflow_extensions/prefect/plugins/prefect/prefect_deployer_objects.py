@@ -142,9 +142,17 @@ class PrefectDeployedFlow(DeployedFlow):
     def id(self) -> str:
         """Deployment identifier encoding all info needed for ``from_deployment``."""
         import json
+        from ._graph import _extract_project
+        try:
+            project_name = _extract_project(self.deployer.flow)
+            if not isinstance(project_name, str):
+                project_name = None
+        except Exception:
+            project_name = None
         return json.dumps({
             "name": self.name,
             "flow_name": self.flow_name,
+            "project_name": project_name,
             "flow_file": getattr(self.deployer, "flow_file", None),
         })
 
@@ -174,10 +182,12 @@ class PrefectDeployedFlow(DeployedFlow):
             id_data = json.loads(identifier)
             deployment_name = id_data.get("name", identifier)
             _known_flow_name = id_data.get("flow_name")
+            _known_project_name = id_data.get("project_name")
             _known_flow_file = id_data.get("flow_file")
         except (json.JSONDecodeError, AttributeError):
             deployment_name = identifier
             _known_flow_name = None
+            _known_project_name = None
             _known_flow_file = None
 
         # Query Prefect to find the flow name for this deployment.
@@ -211,11 +221,23 @@ class PrefectDeployedFlow(DeployedFlow):
             except Exception:
                 return name, None
 
-        # If the identifier came from the ``id`` property, we already know the flow name.
+        # If the identifier came from the ``id`` property, we already know the flow name
+        # and project name (project_name may be None for flows without @project).
         # Otherwise query Prefect to find the flow name for this deployment.
-        if _known_flow_name is not None:
+        if _known_flow_name is not None and _known_project_name is not None:
             flow_name = _known_flow_name
-            project_name = None
+            project_name = _known_project_name
+        elif _known_flow_name is not None:
+            # Older id JSON without project_name — query Prefect to retrieve it.
+            import concurrent.futures
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    _, project_name = pool.submit(
+                        asyncio.run, _get_flow_info(deployment_name)
+                    ).result(timeout=30)
+            except Exception:
+                project_name = None
+            flow_name = _known_flow_name
         else:
             # Always run the async query in a fresh daemon thread with its own event loop.
             # This avoids conflicts with any existing event loop in the calling thread

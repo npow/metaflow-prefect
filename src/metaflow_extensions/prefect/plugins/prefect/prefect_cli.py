@@ -307,15 +307,9 @@ def trigger(
         k, _, v = kv.partition("=")
         params[k.strip()] = v.strip()
 
-    # Build the Prefect flow name the same way create does: prefix with project
-    # name if @project is present, so trigger can find the right deployment.
-    from ._graph import _extract_project
-    project_name = _extract_project(obj.flow)  # type: ignore[attr-defined]
     metaflow_flow_name = obj.flow.name  # type: ignore[attr-defined]
-    prefect_flow_name = f"{project_name}.{metaflow_flow_name}" if project_name else metaflow_flow_name
     asyncio.run(
         _trigger_deployment(
-            prefect_flow_name=prefect_flow_name,
             metaflow_flow_name=metaflow_flow_name,
             deployment_name=name,
             params=params,
@@ -540,7 +534,6 @@ async def _sync_automations(
 
 
 async def _trigger_deployment(
-    prefect_flow_name: str,
     metaflow_flow_name: str,
     deployment_name: str,
     params: dict[str, str],
@@ -553,8 +546,6 @@ async def _trigger_deployment(
         from prefect.client.schemas.filters import (
             DeploymentFilter,
             DeploymentFilterName,
-            FlowFilter,
-            FlowFilterName,
         )
     except ImportError:
         raise PrefectException(
@@ -564,12 +555,11 @@ async def _trigger_deployment(
 
     async with get_client() as client:
         deployments = await client.read_deployments(
-            flow_filter=FlowFilter(name=FlowFilterName(any_=[prefect_flow_name])),
             deployment_filter=DeploymentFilter(name=DeploymentFilterName(any_=[deployment_name])),
         )
         if not deployments:
             raise PrefectException(
-                f"No deployment named {deployment_name!r} found for flow {prefect_flow_name!r}."
+                f"No deployment named {deployment_name!r} found."
             )
         deployment = deployments[0]
         flow_run = await client.create_flow_run_from_deployment(
