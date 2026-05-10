@@ -142,6 +142,7 @@ class PrefectDeployedFlow(DeployedFlow):
     def id(self) -> str:
         """Deployment identifier encoding all info needed for ``from_deployment``."""
         import json
+
         from ._graph import _extract_project
         try:
             project_name = _extract_project(self.deployer.flow)
